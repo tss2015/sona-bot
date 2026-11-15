@@ -18,6 +18,9 @@ Modules
 4. Captcha verification     : restrict on join, inline button, JobQueue timeout.
 5. Shadow-reply             : delete admin command, resend payload as the bot.
 6. Word jumble game         : /new /new4 /new5 /new6, 30 guesses, icon hints.
+7. Greetings & PM console   : /welcome /setwelcome /rmwelcome (+goodbye),
+                              welcome after captcha, owner-only /connect link.
+8. Ban ledger & /cancel     : /banned and /unban records; /cancel stops @all.
 
 Quick start
 -----------
@@ -807,10 +810,20 @@ class Database:
 # --------------------------------------------------------------------------- #
 
 GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
+
+# Compatibility across PTB versions: the group owner is ChatMemberStatus.OWNER
+# in current releases, but some builds also expose CREATOR. Never hard-code one.
+_OWNER_STATUS = getattr(ChatMemberStatus, "OWNER", "creator")
+_CREATOR_STATUS = getattr(ChatMemberStatus, "CREATOR", _OWNER_STATUS)
+_OWNER_STATUSES = frozenset({_OWNER_STATUS, _CREATOR_STATUS})
+_ADMIN_STATUS = getattr(ChatMemberStatus, "ADMINISTRATOR", "administrator")
+_ADMIN_STATUSES = _OWNER_STATUSES | {_ADMIN_STATUS}
+
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 _ADMIN_CACHE: dict[tuple[int, int], tuple[bool, float]] = {}
 BROADCAST_LAST: dict[int, float] = {}
-BROADCAST_LOCKS: dict[int, asyncio.Lock] = {}
+BROADCAST_ACTIVE: set[int] = set()   # broadcasts currently running as tasks
+BROADCAST_CANCEL: set[int] = set()   # cooperative /cancel flags
 SHADOW_LAST: dict[int, float] = {}
 
 LINK_RE = re.compile(
@@ -826,7 +839,9 @@ NOTE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
 
 
 def esc(value: Any) -> str:
-    return html.escape(str(value), quote=True)
+    # quote=False is safe for element text and avoids numeric entities such
+    # as &#x27;, which Telegram's HTML parser can reject for names like O'Brien.
+    return html.escape(str(value), quote=False)
 
 
 def mention(user_id: int, name: str) -> str:
@@ -908,7 +923,7 @@ async def is_admin(bot, chat_id: int, user_id: int, ttl: float = 45.0) -> bool:
         return cached[0]
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        allowed = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
+        allowed = member.status in _ADMIN_STATUSES
     except TelegramError as exc:
         logger.debug("Admin lookup failed for %s in %s: %s", user_id, chat_id, exc)
         return False
@@ -957,17 +972,22 @@ RIGHT_LABELS = {
 
 async def has_right(bot, chat_id: int, user_id: int, right: str,
                     cfg: Optional[Config] = None) -> bool:
-    """Check a specific Telegram admin right (creator and bot owners always pass)."""
-    if cfg and user_id in cfg.owner_ids:
-        return True
+    """Check one specific Telegram admin right (group creator always passes).
+
+    Deliberately does NOT grant bot-owner IDs an override: the requirement is
+    that only members who really hold the right (e.g. can_restrict_members for
+    /ban) can execute destructive moderation. bot.ban_chat_member would fail
+    anyway if the bot itself lacks its own admin right.
+    """
+    _ = cfg  # Kept in the signature for call-site compatibility.
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
     except TelegramError as exc:
         logger.debug("Right lookup failed for %s/%s: %s", chat_id, user_id, exc)
         return False
-    if member.status == ChatMemberStatus.CREATOR:
+    if member.status in _OWNER_STATUSES:
         return True
-    if member.status != ChatMemberStatus.ADMINISTRATOR:
+    if member.status not in _ADMIN_STATUSES:
         return False
     return bool(getattr(member, right, False))
 
@@ -1785,16 +1805,144 @@ async def send_mention_batch(bot, chat_id: int, members: list[dict]) -> None:
             await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
             return
         except RetryAfter as exc:
-            # Telegram asked us explicitly to slow down: obey the flood-wait.
-            await asyncio.sleep(float(exc.retry_after) + 1.0)
+            # Telegram asked us explicitly to slow down: obey the flood-wait,
+            # but keep polling the cancellation flag while we wait.
+            retry = getattr(exc, "retry_after", 3)
+            wait = (retry.total_seconds() if hasattr(retry, "total_seconds")
+                    else float(retry)) + 1.0
+            logger.warning("Flood-wait %.1fs in chat %s; sleeping", wait, chat_id)
+            if await cancellable_sleep(chat_id, wait):
+                logger.info("Flood-wait interrupted by /cancel in chat %s", chat_id)
+                return
         except (BadRequest, Forbidden, TelegramError) as exc:
             logger.warning("Mention batch failed in %s: %s", chat_id, exc)
             return
     logger.warning("Giving up on a mention batch in %s after flood retries", chat_id)
 
 
+async def cancellable_sleep(chat_id: int, seconds: float) -> bool:
+    """Sleep in small slices so /cancel takes effect within ~250ms.
+
+    Returns True when a cancellation was requested for this chat.
+    """
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if chat_id in BROADCAST_CANCEL:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return chat_id in BROADCAST_CANCEL
+        await asyncio.sleep(min(0.25, remaining))
+
+
+async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: stop the mention broadcast currently running in this group."""
+    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if chat.type not in GROUP_TYPES:
+        await message.reply_text("Use /cancel in the group where the mention is running.")
+        return
+    cfg, _ = state(context)
+    if not await is_privileged(bot_of(context), chat.id, user.id, cfg):
+        await message.reply_text("🔒 Only group admins can cancel a mention broadcast.")
+        return
+    if chat.id not in BROADCAST_ACTIVE:
+        BROADCAST_CANCEL.discard(chat.id)
+        await message.reply_text("No mention broadcast is running in this group.")
+        return
+    BROADCAST_CANCEL.add(chat.id)
+    await message.reply_text(
+        "🛑 <b>Cancellation requested.</b> The current batch finishes, then the "
+        "mention loop stops. The cooldown remains active.", parse_mode=ParseMode.HTML)
+    logger.info("broadcast cancellation requested chat=%s by=%s", chat.id, user.id)
+
+
+async def broadcast_worker(bot, chat, user, cfg: Config, db: Database, mode: str,
+                           note: str, application: Application) -> None:
+    """Run one @all/@admin broadcast as a background task.
+
+    PTB processes updates sequentially by default. Starting this as a task lets
+    /cancel (a later update) run while this coroutine is sleeping or retrying.
+    """
+    chat_id = chat.id
+    try:
+        if mode == "admin":
+            try:
+                admins = await bot.get_chat_administrators(chat_id)
+            except TelegramError as exc:
+                await temp_reply(bot, chat_id, f"Could not read admin list: {esc(exc)}",
+                                 delay=8, application=application)
+                return
+            targets = []
+            for admin in admins:
+                if not admin.user or admin.user.is_bot:
+                    continue  # Never mention bot accounts.
+                await db.run(db.upsert_member, chat_id, admin.user, True)
+                targets.append({"user_id": admin.user.id, "name": admin.user.full_name,
+                                "username": admin.user.username or ""})
+            label = "human administrators (bots excluded)"
+        else:
+            # Capture current admins first, then mention EVERY known human member.
+            # There is no last_seen filter: dormant members are included, and
+            # bots are excluded by mention_members().
+            await sync_admin_roster(bot, db, chat_id)
+            targets = await db.run(db.mention_members, chat_id, cfg.max_mentions)
+            label = "known members — active or dormant · bots excluded"
+
+        if not targets:
+            await temp_reply(bot, chat_id,
+                             "No human members are on the mention roster yet. I learn members "
+                             "from joins, messages and the admin list; run /syncmembers after "
+                             "adding admins, and new joiners are captured automatically.",
+                             delay=12, application=application)
+            return
+
+        if chat_id in BROADCAST_CANCEL:
+            await temp_reply(bot, chat_id, "🛑 Broadcast cancelled before any mention was sent.",
+                             delay=8, application=application)
+            return
+
+        batches = list(chunks(targets, cfg.mention_batch_size))
+        pauses = max(0, len(batches) - 1)
+        eta_seconds = int(pauses * cfg.mention_delay)
+        eta = (f"{eta_seconds // 60}m {eta_seconds % 60}s" if eta_seconds >= 60
+               else f"{eta_seconds}s")
+        cap_note = " · MAX_MENTIONS cap applied" if cfg.max_mentions else ""
+        header = (f"📢 <b>Announcement from {mention(user.id, user.full_name)}</b>\n"
+                  f"{esc(note) if note else '(no message attached)'}\n"
+                  f"<i>Mentioning {len(targets)} {label}{cap_note} — "
+                  f"{cfg.mention_delay:g}s apart, ~{eta} total. Send /cancel to stop.</i>")
+        await bot.send_message(chat_id=chat_id, text=header, parse_mode=ParseMode.HTML)
+
+        sent_batches = 0
+        for index, batch in enumerate(batches):
+            if chat_id in BROADCAST_CANCEL:
+                await temp_reply(
+                    bot, chat_id,
+                    f"🛑 Broadcast cancelled by an admin after {sent_batches}/{len(batches)} "
+                    "message(s).", delay=8, application=application)
+                logger.info("broadcast cancelled chat=%s after=%d/%d",
+                            chat_id, sent_batches, len(batches))
+                return
+            await send_mention_batch(bot, chat_id, batch)
+            sent_batches += 1
+            if index < len(batches) - 1:
+                # Flood-safe pacing; /cancel breaks out within ~250ms.
+                await cancellable_sleep(chat_id, cfg.mention_delay)
+        logger.info("broadcast mode=%s chat=%s targets=%d batches=%d",
+                    mode, chat_id, len(targets), len(batches))
+    except (Forbidden, BadRequest, TelegramError) as exc:
+        logger.warning("Broadcast failed in chat %s: %s", chat_id, exc)
+        await temp_reply(bot, chat_id, f"⚠️ Broadcast stopped: {esc(exc)}",
+                         delay=10, application=application)
+    except Exception:  # A background task must never take the app down.
+        logger.exception("Broadcast worker crashed in chat %s", chat_id)
+    finally:
+        BROADCAST_ACTIVE.discard(chat_id)
+        BROADCAST_CANCEL.discard(chat_id)
+
+
 async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """@all/@admin (or /mentionall, /mentionadmin) - paced by asyncio.sleep(3)."""
+    """Validate @all/@admin quickly, then start the paced background worker."""
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
     match = BROADCAST_RE.match(message.text or "")
     if not match:
@@ -1811,10 +1959,9 @@ async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                          f"🔒 {mention(user.id, user.full_name)}, mass mentions are admin-only.",
                          delay=8, application=application)
         raise ApplicationHandlerStop
-
-    lock = BROADCAST_LOCKS.setdefault(chat.id, asyncio.Lock())
-    if lock.locked():
-        await temp_reply(bot, chat.id, "⏳ A broadcast is already running in this chat.",
+    if chat.id in BROADCAST_ACTIVE:
+        await temp_reply(bot, chat.id, "⏳ A broadcast is already running in this chat. "
+                                      "Use /cancel to stop it.",
                          delay=6, application=application)
         raise ApplicationHandlerStop
     now = time.monotonic()
@@ -1825,58 +1972,11 @@ async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                          "before another broadcast.", delay=6, application=application)
         raise ApplicationHandlerStop
 
-    async with lock:
-        BROADCAST_LAST[chat.id] = now
-        if mode == "admin":
-            try:
-                admins = await bot.get_chat_administrators(chat.id)
-            except TelegramError as exc:
-                await temp_reply(bot, chat.id, f"Could not read admin list: {esc(exc)}",
-                                 delay=8, application=application)
-                raise ApplicationHandlerStop
-            targets = []
-            for admin in admins:
-                if not admin.user or admin.user.is_bot:
-                    continue  # Never mention bot accounts.
-                await db.run(db.upsert_member, chat.id, admin.user, True)
-                targets.append({"user_id": admin.user.id, "name": admin.user.full_name,
-                                "username": admin.user.username or ""})
-            label = "human administrators (bots excluded)"
-        else:
-            # Capture current admins first, then mention EVERY known human member.
-            # There is no last_seen filter: dormant members are included, and
-            # bots are excluded by mention_members().
-            await sync_admin_roster(bot, db, chat.id)
-            targets = await db.run(db.mention_members, chat.id, cfg.max_mentions)
-            label = "known members — active or dormant · bots excluded"
-
-        if not targets:
-            await temp_reply(bot, chat.id,
-                             "No human members are on the mention roster yet. I learn members "
-                             "from joins, messages and the admin list; run /syncmembers after "
-                             "adding admins, and new joiners are captured automatically.",
-                             delay=12, application=application)
-            raise ApplicationHandlerStop
-
-        batches = list(chunks(targets, cfg.mention_batch_size))
-        pauses = max(0, len(batches) - 1)
-        eta_seconds = int(pauses * cfg.mention_delay)
-        eta = (f"{eta_seconds // 60}m {eta_seconds % 60}s" if eta_seconds >= 60
-               else f"{eta_seconds}s")
-        cap_note = " · MAX_MENTIONS cap applied" if cfg.max_mentions else ""
-        header = (f"📢 <b>Announcement from {mention(user.id, user.full_name)}</b>\n"
-                  f"{esc(note) if note else '(no message attached)'}\n"
-                  f"<i>Mentioning {len(targets)} {label}{cap_note} — "
-                  f"{cfg.mention_delay:g}s apart, ~{eta} total.</i>")
-        await bot.send_message(chat_id=chat.id, text=header, parse_mode=ParseMode.HTML)
-
-        for index, batch in enumerate(batches):
-            await send_mention_batch(bot, chat.id, batch)
-            if index < len(batches) - 1:
-                # The safe interval that prevents Telegram flood-wait errors.
-                await asyncio.sleep(cfg.mention_delay)
-        logger.info("broadcast mode=%s chat=%s targets=%d batches=%d",
-                    mode, chat.id, len(targets), len(batches))
+    BROADCAST_CANCEL.discard(chat.id)  # Never inherit a stale cancellation.
+    BROADCAST_ACTIVE.add(chat.id)
+    BROADCAST_LAST[chat.id] = now
+    spawn(broadcast_worker(bot, chat, user, cfg, db, mode, note, application), application)
+    logger.info("broadcast queued mode=%s chat=%s by=%s", mode, chat.id, user.id)
     raise ApplicationHandlerStop  # never let the safeguard layer re-read this text
 
 
@@ -1886,8 +1986,7 @@ async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def memberish(member: Any) -> bool:
     status = member.status
-    if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
-                  ChatMemberStatus.CREATOR):
+    if status == ChatMemberStatus.MEMBER or status in _ADMIN_STATUSES:
         return True
     return status == ChatMemberStatus.RESTRICTED and bool(getattr(member, "is_member", False))
 
@@ -2301,7 +2400,8 @@ async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     token = secrets.token_urlsafe(18)
     await db.run(db.create_connect_token, token, chat.id, user.id)
     try:
-        username = context.application.bot.username or (await bot.get_me()).username
+        username = (getattr(context.application.bot, "username", None)
+                    or (await bot.get_me()).username)
     except TelegramError:
         username = getattr(bot, "username", None)
     if not username:
@@ -2541,6 +2641,7 @@ Then use /welcome /setwelcome /rmwelcome /goodbye /setgoodbye
 @all [message] or /mentionall [message] — every known human,
     active or dormant (bots never mentioned)
 @admin [message] or /mentionadmin [message] — human administrators only
+/cancel — stop the running mention broadcast (admin)
 /members — inspect the mention roster
 /syncmembers — capture current admins into the roster (admin)
 
@@ -2684,7 +2785,7 @@ def register_handlers(application: Application, cfg: Config) -> None:
         "setnote": cmd_setnote, "note": cmd_note, "notes": cmd_notes, "delnote": cmd_delnote,
         "trust": cmd_trust, "untrust": cmd_untrust,
         "members": cmd_members, "syncmembers": cmd_syncmembers,
-        "mentionall": on_broadcast, "mentionadmin": on_broadcast,
+        "mentionall": on_broadcast, "mentionadmin": on_broadcast, "cancel": cmd_cancel,
         "shadowreply": cmd_shadowreply,
         "new": cmd_new, "new4": cmd_new, "new5": cmd_new, "new6": cmd_new,
         "game": cmd_game, "stopgame": cmd_stopgame, "top": cmd_top,
