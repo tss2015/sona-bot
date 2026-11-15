@@ -3,7 +3,8 @@
 """
 Miss Sona - all-in-one Telegram group management and gaming bot.
 
-Single-file deployment blueprint built on python-telegram-bot v20+/v21.x.
+Single-file deployment blueprint built for python-telegram-bot v20, v21 and
+v22 (no removed status constants; raw Bot API status strings are used).
 
 Modules
 -------
@@ -16,9 +17,7 @@ Modules
                               mentions with a safe 3-second pacing interval.
 4. Captcha verification     : restrict on join, inline button, JobQueue timeout.
 5. Shadow-reply             : delete admin command, resend payload as the bot.
-6. Word jumble game         : /new /new4 /new5 /new6, explicit /guess, /hint,
-                               /giveup, duplicate-safe scoring, cached hot path,
-                               serialized writes, rate limits and 48h expiry.
+6. Word jumble game         : /new /new4 /new5 /new6, 30 guesses, icon hints.
 
 Quick start
 -----------
@@ -69,7 +68,7 @@ except ImportError:  # pragma: no cover - env vars work without it
     pass
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
+from telegram.constants import ChatType, MessageEntityType, ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -306,17 +305,6 @@ CREATE TABLE IF NOT EXISTS notes (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (chat_id, name)
 );
--- Global owner-managed banned-word vault: intentionally no chat_id.
--- One row per word/phrase; every group shares this list.
-CREATE TABLE IF NOT EXISTS banned_words (
-    word        TEXT PRIMARY KEY,
-    added_by    INTEGER NOT NULL DEFAULT 0,
-    created_at  REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS settings (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS warnings (
     chat_id     INTEGER NOT NULL,
     user_id     INTEGER NOT NULL,
@@ -466,88 +454,6 @@ class Database:
             cursor = conn.execute("DELETE FROM notes WHERE chat_id=? AND name=?", (chat_id, name))
             conn.commit()
             return cursor.rowcount > 0
-
-    # -- global banned-word vault (shared by every chat) --------------------
-    def seed_banned_words(self, words: Iterable[str], added_by: int = 0) -> bool:
-        """Seed the defaults once; an owner-cleared vault stays empty."""
-        cleaned = [word for word in
-                   dict.fromkeys(normalize(raw) for raw in words if raw) if word]
-        with self._lock:
-            conn = self._connect()
-            marker = conn.execute(
-                "SELECT value FROM settings WHERE key='banned_words_seeded'").fetchone()
-            if marker:
-                return False
-            seeded = False
-            if not conn.execute("SELECT COUNT(*) FROM banned_words").fetchone()[0]:
-                conn.executemany(
-                    "INSERT OR IGNORE INTO banned_words (word, added_by, created_at) "
-                    "VALUES (?, ?, ?)",
-                    [(word, added_by, time.time()) for word in cleaned])
-                seeded = bool(cleaned)
-            conn.execute(
-                "INSERT OR REPLACE INTO settings (key, value) "
-                "VALUES ('banned_words_seeded', '1')")
-            conn.commit()
-            return seeded
-
-    def list_banned_words(self) -> list[str]:
-        rows = self._query("SELECT word FROM banned_words ORDER BY word",
-                           fetch="all") or []
-        return [str(row["word"]) for row in rows]
-
-    def count_banned_words(self) -> int:
-        row = self._query("SELECT COUNT(*) AS n FROM banned_words", fetch="one")
-        return int(row["n"]) if row else 0
-
-    def add_banned_words(self, words: Iterable[str],
-                         added_by: int) -> tuple[list[str], list[str]]:
-        cleaned = list(dict.fromkeys(word for word in words if word))
-        with self._lock:
-            conn = self._connect()
-            existing = {row["word"] for row in conn.execute("SELECT word FROM banned_words")}
-            added = [word for word in cleaned if word not in existing]
-            conn.executemany(
-                "INSERT OR IGNORE INTO banned_words (word, added_by, created_at) "
-                "VALUES (?, ?, ?)",
-                [(word, added_by, time.time()) for word in added])
-            conn.commit()
-        return added, [word for word in cleaned if word in existing]
-
-    def remove_banned_words(self, words: Iterable[str]) -> list[str]:
-        cleaned = list(dict.fromkeys(word for word in words if word))
-        if not cleaned:
-            return []
-        placeholders = ",".join("?" for _ in cleaned)
-        with self._lock:
-            conn = self._connect()
-            existing = {
-                row["word"] for row in conn.execute(
-                    f"SELECT word FROM banned_words WHERE word IN ({placeholders})", cleaned)
-            }
-            conn.execute(f"DELETE FROM banned_words WHERE word IN ({placeholders})", cleaned)
-            conn.commit()
-        return [word for word in cleaned if word in existing]
-
-    def replace_banned_words(self, words: Iterable[str], added_by: int) -> int:
-        cleaned = list(dict.fromkeys(word for word in words if word))
-        with self._lock:
-            conn = self._connect()
-            conn.execute("DELETE FROM banned_words")
-            conn.executemany(
-                "INSERT OR IGNORE INTO banned_words (word, added_by, created_at) "
-                "VALUES (?, ?, ?)",
-                [(word, added_by, time.time()) for word in cleaned])
-            conn.commit()
-        return len(cleaned)
-
-    def clear_banned_words(self) -> int:
-        with self._lock:
-            conn = self._connect()
-            removed = conn.execute("SELECT COUNT(*) FROM banned_words").fetchone()[0]
-            conn.execute("DELETE FROM banned_words")
-            conn.commit()
-            return int(removed)
 
     # -- strikes ------------------------------------------------------------
     def add_warn(self, chat_id: int, user_id: int) -> int:
@@ -716,11 +622,25 @@ class Database:
 # --------------------------------------------------------------------------- #
 
 GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
-# Compatibility: python-telegram-bot renamed ChatMemberStatus.CREATOR to OWNER.
-# Never reference a missing attribute again - resolve it once, with fallbacks.
-OWNER_STATUS = getattr(ChatMemberStatus, "OWNER", getattr(ChatMemberStatus, "CREATOR", "creator"))
-ADMIN_STATUSES = frozenset({ChatMemberStatus.ADMINISTRATOR, OWNER_STATUS})
-ACTIVE_STATUSES = frozenset({ChatMemberStatus.MEMBER, *ADMIN_STATUSES})
+
+# Telegram Bot API chat-member status strings. We intentionally compare raw
+# strings instead of PTB constants: ChatMemberStatus.CREATOR was renamed to
+# OWNER in python-telegram-bot 20 and CREATOR no longer exists. Raw values
+# keep this bot working on PTB 20, 21 and 22 alike.
+STATUS_MEMBER = "member"
+STATUS_ADMIN = "administrator"
+STATUS_OWNER = "creator"  # Bot API value behind ChatMemberStatus.OWNER
+STATUS_RESTRICTED = "restricted"
+ADMIN_STATUSES = frozenset({STATUS_ADMIN, STATUS_OWNER})
+MEMBER_STATUSES = frozenset({STATUS_MEMBER, STATUS_ADMIN, STATUS_OWNER})
+
+
+def status_value(status: Any) -> str:
+    """Return the raw Bot API status string for a str/Enum/None value."""
+    value = getattr(status, "value", status)
+    return str(value).lower() if value is not None else ""
+
+
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 _ADMIN_CACHE: dict[tuple[int, int], tuple[bool, float]] = {}
 BROADCAST_LAST: dict[int, float] = {}
@@ -772,27 +692,6 @@ def spawn(coro, application: Optional[Application] = None) -> asyncio.Task:
     return task
 
 
-async def refresh_matcher(application: Application) -> list[str]:
-    """Reload the shared vault and swap in a fresh matcher.
-
-    Handlers read bot_data["matcher"] per message, so owner edits apply to every
-    group immediately with no restart.
-    """
-    db: Database = application.bot_data["db"]
-    words = await db.run(db.list_banned_words)
-    application.bot_data["matcher"] = KeywordMatcher(words)
-    logger.info("Banned-word matcher refreshed (%d global entries)", len(words))
-    return words
-
-
-async def refresh_banned_words_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Pick up manual SQLite edits without restarting the bot."""
-    try:
-        await refresh_matcher(context.application)
-    except Exception as exc:  # Keep the scheduler alive through transient DB errors.
-        logger.warning("Could not refresh banned words from the database: %s", exc)
-
-
 async def safe_delete(bot, chat_id: int, message_id: int) -> bool:
     try:
         return bool(await bot.delete_message(chat_id=chat_id, message_id=message_id))
@@ -833,24 +732,18 @@ async def send_long(bot, chat_id: int, text: str, **kwargs: Any) -> None:
 
 
 async def is_admin(bot, chat_id: int, user_id: int, ttl: float = 45.0) -> bool:
-    """Cached admin check to avoid a getChatMember call on every message.
-
-    PTB v21 exposes the group creator as ChatMemberStatus.OWNER; older releases
-    used CREATOR. ``ADMIN_STATUSES`` supports both, which fixes the production
-    AttributeError that previously disabled every moderation command.
-    """
+    """Cached admin check to avoid a getChatMember call on every message."""
     key = (chat_id, user_id)
     cached = _ADMIN_CACHE.get(key)
     if cached and time.monotonic() - cached[1] < ttl:
         return cached[0]
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        allowed = getattr(member, "status", "") in ADMIN_STATUSES
+        # Version-proof: 'administrator' or 'creator' (PTB 20+ exposes the
+        # owner status as ChatMemberStatus.OWNER, not the old CREATOR).
+        allowed = status_value(getattr(member, "status", "")) in ADMIN_STATUSES
     except TelegramError as exc:
         logger.debug("Admin lookup failed for %s in %s: %s", user_id, chat_id, exc)
-        return False
-    except AttributeError as exc:  # Defensive: unknown PTB status object.
-        logger.error("Admin status compatibility error: %s", exc)
         return False
     if len(_ADMIN_CACHE) > 2000:
         _ADMIN_CACHE.clear()
@@ -882,15 +775,9 @@ async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE,
         await message.reply_text("This command only works in groups.")
         return False
     cfg, _ = state(context)
-    # Anonymous group admins post as the group itself; treat them as admins.
-    if getattr(message, "sender_chat", None) and message.sender_chat.id == chat.id:
-        return True
     if await is_privileged(bot_of(context), chat.id, user.id, cfg):
         return True
-    await message.reply_text(
-        f"🔒 Only admins can {action}.\n"
-        "<i>If you are an admin, run /diag — I may be missing the rights needed "
-        "to verify members.</i>", parse_mode=ParseMode.HTML)
+    await message.reply_text(f"🔒 Only admins can {action}.")
     return False
 
 
@@ -1235,165 +1122,6 @@ async def cmd_untrust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------- #
-# 1c. Owner-only global banned-word vault                                      #
-# --------------------------------------------------------------------------- #
-
-WORD_INPUT_SPLIT = re.compile(r"[,;\n]+")
-WORD_VALID_RE = re.compile(r"^[a-z0-9][a-z0-9 ]*$")
-
-
-async def require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                        action: str = "manage banned words") -> bool:
-    """The vault is global, so only configured bot owners may modify it."""
-    user, message = update.effective_user, update.effective_message
-    if not user or not message:
-        return False
-    cfg, _ = state(context)
-    if user.id in cfg.owner_ids:
-        return True
-    await message.reply_text(
-        f"🔒 Only a bot owner can {action}.\n"
-        "The vault is global and affects every group. If you are the owner, run "
-        "/diag for the exact <code>OWNER_IDS</code> value to configure.",
-        parse_mode=ParseMode.HTML)
-    return False
-
-
-def parse_word_input(payload: str) -> tuple[list[str], list[str]]:
-    """Normalize comma/semicolon/newline separated terms into stored form."""
-    valid: list[str] = []
-    invalid: list[str] = []
-    for raw in WORD_INPUT_SPLIT.split(payload or ""):
-        if not raw.strip():
-            continue
-        word = normalize(raw).strip()
-        if 2 <= len(word) <= 64 and WORD_VALID_RE.fullmatch(word):
-            if word not in valid:
-                valid.append(word)
-        else:
-            invalid.append(raw.strip())
-    return valid, invalid
-
-
-def words_html(words: Iterable[str], limit: int = 80) -> str:
-    items = list(words)
-    text = ", ".join(f"<code>{esc(word)}</code>" for word in items[:limit])
-    if len(items) > limit:
-        text += f" …and {len(items) - limit} more"
-    return text or "<i>(none)</i>"
-
-
-async def cmd_bannedwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the shared vault; from groups it is delivered privately."""
-    if not await require_owner(update, context, "view the banned-word vault"):
-        return
-    _, db = state(context)
-    words = await db.run(db.list_banned_words)
-    body = (
-        "🚫 <b>Global banned-word vault</b>\n"
-        "<i>One SQLite list shared by every group. Changes are live immediately.</i>\n\n"
-        f"<b>{len(words)}</b> entries:\n{words_html(words)}\n\n"
-        "<b>Owner commands</b>\n"
-        "/addword word1, word2 · /delword word\n"
-        "/setwords word1, word2 · /clearbannedwords"
-    )
-    bot, chat, user = bot_of(context), update.effective_chat, update.effective_user
-    if chat.type != ChatType.PRIVATE:
-        try:
-            await send_long(bot, user.id, f"{body}\n\n<i>Requested in chat {chat.id}</i>")
-            await update.effective_message.reply_text(
-                "📬 The shared vault was sent to your DM.")
-        except (Forbidden, BadRequest):
-            await update.effective_message.reply_text(
-                "📬 I can't DM you yet. Send /start to me privately, then run "
-                "/bannedwords there.")
-        return
-    await send_long(bot, chat.id, body)
-
-
-async def cmd_addword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_owner(update, context, "add banned words"):
-        return
-    message = update.effective_message
-    valid, invalid = parse_word_input(command_payload(message))
-    if not valid:
-        await message.reply_text(
-            "Usage: <code>/addword casino-spam, free-crypto</code>\n"
-            "Separate terms with commas or new lines (2–64 characters).",
-            parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    added, existing = await db.run(db.add_banned_words, valid, update.effective_user.id)
-    total = len(await refresh_matcher(context.application))
-    lines = []
-    if added:
-        lines.append(f"✅ Added <b>{len(added)}</b>: {words_html(added)}")
-    if existing:
-        lines.append(f"ℹ️ Already present: {words_html(existing)}")
-    if invalid:
-        lines.append(f"⚠️ Invalid: {esc(', '.join(invalid))}")
-    lines.append(f"🌍 The shared vault now has <b>{total}</b> entries, live in every group.")
-    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def cmd_delword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_owner(update, context, "remove banned words"):
-        return
-    message = update.effective_message
-    valid, invalid = parse_word_input(command_payload(message))
-    if not valid:
-        await message.reply_text("Usage: <code>/delword casino-spam</code> (commas allowed).",
-                                 parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    removed = await db.run(db.remove_banned_words, valid)
-    total = len(await refresh_matcher(context.application))
-    not_found = [word for word in valid if word not in removed]
-    lines = []
-    if removed:
-        lines.append(f"🗑️ Removed <b>{len(removed)}</b>: {words_html(removed)}")
-    if not_found:
-        lines.append(f"ℹ️ Not in the vault: {words_html(not_found)}")
-    if invalid:
-        lines.append(f"⚠️ Invalid: {esc(', '.join(invalid))}")
-    lines.append(f"🌍 The shared vault now has <b>{total}</b> entries.")
-    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
-
-
-async def cmd_setwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_owner(update, context, "replace the banned-word vault"):
-        return
-    message = update.effective_message
-    valid, invalid = parse_word_input(command_payload(message))
-    if not valid:
-        await message.reply_text(
-            "Usage: <code>/setwords word1, word2, word3</code>\n"
-            "This replaces the entire shared list. Use /clearbannedwords to empty it.",
-            parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    count = await db.run(db.replace_banned_words, valid, update.effective_user.id)
-    await refresh_matcher(context.application)
-    extra = f"\n⚠️ Ignored invalid: {esc(', '.join(invalid))}" if invalid else ""
-    await message.reply_text(
-        f"✅ Shared vault replaced with <b>{count}</b> entries.{extra}\n"
-        "<i>All groups now use exactly this list.</i>", parse_mode=ParseMode.HTML)
-
-
-async def cmd_clearbannedwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_owner(update, context, "clear the banned-word vault"):
-        return
-    _, db = state(context)
-    removed = await db.run(db.clear_banned_words)
-    await refresh_matcher(context.application)
-    await update.effective_message.reply_text(
-        f"🧹 Removed <b>{removed}</b> entries. The vault is empty and matching is paused "
-        "until words are added again (link filtering still runs).\n"
-        "<i>This persists across restarts; BANNED_WORDS will not be re-applied.</i>",
-        parse_mode=ParseMode.HTML)
-
-
-# --------------------------------------------------------------------------- #
 # 2. Link / keyword / OCR safeguards                                           #
 # --------------------------------------------------------------------------- #
 
@@ -1643,11 +1371,11 @@ async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --------------------------------------------------------------------------- #
 
 def memberish(member: Any) -> bool:
-    """True when a ChatMember update describes someone who is currently in chat."""
-    status = getattr(member, "status", "")
-    if status in ACTIVE_STATUSES:
+    """True for statuses that count as being in the chat (version-proof)."""
+    status = status_value(getattr(member, "status", ""))
+    if status in MEMBER_STATUSES:
         return True
-    return status == ChatMemberStatus.RESTRICTED and bool(getattr(member, "is_member", False))
+    return status == STATUS_RESTRICTED and bool(getattr(member, "is_member", False))
 
 
 async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1823,24 +1551,13 @@ async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 # --------------------------------------------------------------------------- #
 
 EXACT_ICON, MISPLACED_ICON, MISSING_ICON = "🎯", "🔀", "🚫"
-HINT_LEGEND = (f"{EXACT_ICON} exact spot · {MISPLACED_ICON} right letter, "
-               f"wrong spot · {MISSING_ICON} not in the word")
-GAME_CACHE_TTL = 2.0          # Avoid a SQLite read for every ordinary chat message
-GAME_TTL_SECONDS = 48 * 3600  # Abandoned rounds expire instead of lingering forever
-MAX_HINTS = 3                 # Each hint costs one attempt
-GUESS_COOLDOWN = 1.0          # Per-user anti-spam for bare-word guessing
-GAME_CACHE: dict[int, tuple[Optional[dict], float]] = {}
-GAME_LOCKS: dict[int, asyncio.Lock] = {}
-LAST_GUESS: dict[tuple[int, int], float] = {}
+HINT_LEGEND = (f"{EXACT_ICON} right letter &amp; spot · "
+               f"{MISPLACED_ICON} right letter, wrong spot · "
+               f"{MISSING_ICON} not in the word")
 
 
 def score_guess(guess: str, answer: str) -> str:
-    """Two-pass Wordle scoring with correct duplicate-letter handling.
-
-    Returns one icon per letter: 🎯 exact position, 🔀 present elsewhere,
-    🚫 absent. Duplicate letters are counted correctly: scoring an exact match
-    never "uses up" a letter that a later misplaced match could consume.
-    """
+    """Two-pass Wordle scoring with correct duplicate-letter handling."""
     length = len(answer)
     result = [MISSING_ICON] * length
     remaining: Counter = Counter()
@@ -1858,215 +1575,26 @@ def score_guess(guess: str, answer: str) -> str:
     return "".join(result)
 
 
-def safe_guesses(raw: Any) -> list[dict]:
-    """Tolerate NULL, malformed JSON and legacy rows without crashing a game."""
-    try:
-        data = raw if isinstance(raw, list) else json.loads(raw or "[]")
-    except (TypeError, ValueError):
-        return []
-    return [entry for entry in data if isinstance(entry, dict)] if isinstance(data, list) else []
-
-
-def invalidate_game(chat_id: int) -> None:
-    """Drop the read-through cache after any game mutation."""
-    GAME_CACHE.pop(chat_id, None)
-
-
-async def cached_game(db: Database, chat_id: int) -> Optional[dict]:
-    """Return the game, hitting SQLite at most once per GAME_CACHE_TTL seconds."""
-    cached = GAME_CACHE.get(chat_id)
-    if cached and time.monotonic() - cached[1] < GAME_CACHE_TTL:
-        return cached[0]
-    game = await db.run(db.get_game, chat_id)
-    GAME_CACHE[chat_id] = (game, time.monotonic())
-    return game
-
-
-def guess_entries(game: dict) -> list[dict]:
-    return [entry for entry in safe_guesses(game.get("guesses")) if entry.get("g")]
-
-
-def hint_entries(game: dict) -> list[dict]:
-    return [entry for entry in safe_guesses(game.get("guesses")) if entry.get("t") == "hint"]
-
-
-def format_guess(entry: dict) -> str:
-    """Render one guess as a letter row plus an icon row."""
-    letters = " ".join(str(entry.get("g", "")).upper())
-    icons = " ".join(str(entry.get("h", "")))
-    return f"<code>{letters}</code>\n{icons}"
-
-
-def render_board(game: dict, limit: int = 5) -> str:
-    """Compact, mobile-friendly history: most recent guesses first-class."""
-    entries = guess_entries(game)[-limit:]
-    if not entries:
-        return "<i>No guesses yet — use /guess word or just type one.</i>"
-    return "\n\n".join(
-        f"{format_guess(entry)} <i>· {esc(str(entry.get('n') or 'player')[:24])}</i>"
-        for entry in entries
-    )
-
-
-def game_is_expired(game: dict) -> bool:
-    try:
-        started = float(game.get("started_at") or 0)
-    except (TypeError, ValueError):
-        return False
-    return bool(started) and time.time() - started > GAME_TTL_SECONDS
-
-
 async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or not user:
-        return
+    message, chat = update.effective_message, update.effective_chat
     command = (message.text or "").split()[0].lstrip("/").split("@")[0].lower()
     match = re.fullmatch(r"new(\d)?", command)
     length = int(match.group(1)) if match and match.group(1) else 5
     bank: dict[int, tuple[str, ...]] = context.application.bot_data["words"]
     words = bank.get(length)
     if not words:
-        available = ", ".join(f"/new{n}" for n in sorted(bank))
         await message.reply_text(
-            f"No {length}-letter words are available. Try {available} or /new.")
+            f"No {length}-letter words available. Try: " +
+            ", ".join(f"/new{n}" for n in sorted(bank)) + " or /new.")
         return
     cfg, db = state(context)
     word = secrets.choice(words)
-    # Serialise game mutations: two admins cannot half-start the same round.
-    lock = GAME_LOCKS.setdefault(chat.id, asyncio.Lock())
-    async with lock:
-        await db.run(db.start_game, chat.id, word, length, user.id)
-        invalidate_game(chat.id)
+    await db.run(db.start_game, chat.id, word, length, update.effective_user.id)
     await message.reply_text(
-        f"🎲 <b>New {length}-letter game · {cfg.max_guesses} attempts</b>\n"
-        "First person to guess the word wins.\n\n"
-        f"<b>How to play</b>\n"
-        f"• <code>/guess word</code> or just type a {length}-letter word.\n"
-        f"• {HINT_LEGEND}\n"
-        f"• /hint reveals a letter (max {MAX_HINTS}; costs one attempt).\n"
-        "• /game shows the board · /top shows the leaderboard.\n\n"
-        "Good luck! 🍀", parse_mode=ParseMode.HTML)
-
-
-async def process_guess(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                        raw_guess: str, via_command: bool) -> bool:
-    """Validate, score and persist one guess. Returns True when consumed.
-
-    Returning False for an ordinary chat word lets the safeguard handler in
-    group 4 run normally (link deletion, keyword/Ocr scanning, and strikes).
-    """
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or not user or user.is_bot:
-        return False
-    cfg, db = state(context)
-    game = await cached_game(db, chat.id)
-    if not game or game.get("status") != "active":
-        if via_command:
-            await message.reply_text("There is no active game. Start one with /new, "
-                                     "/new4, /new5 or /new6.")
-            return True
-        return False
-    if game_is_expired(game):
-        await db.run(db.finish_game, chat.id, "expired")
-        invalidate_game(chat.id)
-        if via_command:
-            await message.reply_text("⌛ That round expired. Start a fresh one with /new.")
-        return via_command
-    length = int(game.get("length") or 5)
-    guess = str(raw_guess or "").strip().lower()
-    if not re.fullmatch(r"[a-z]+", guess) or len(guess) != length:
-        if via_command:
-            await message.reply_text(
-                f"Usage: <code>/guess {'•' * length}</code> — exactly <b>{length}</b> "
-                "letters, A–Z only.", parse_mode=ParseMode.HTML)
-        return via_command
-    # Do not let a prohibited word bypass the content filter by claiming a guess.
-    matcher = context.application.bot_data.get("matcher")
-    if matcher is not None and matcher.find(guess):
-        if via_command:
-            await enforce_content_policy(update, context, guess, "text")
-            return True
-        return False
-    key = (chat.id, user.id)
-    now = time.monotonic()
-    if now - LAST_GUESS.get(key, 0.0) < GUESS_COOLDOWN:
-        if via_command:
-            await message.reply_text("⏳ One guess per second — take a breath.")
-            return True
-        return False
-    LAST_GUESS[key] = now
-
-    lock = GAME_LOCKS.setdefault(chat.id, asyncio.Lock())
-    async with lock:
-        # Re-read under the lock: another player may have just won or restarted.
-        game = await db.run(db.get_game, chat.id)
-        if not game or game.get("status") != "active":
-            invalidate_game(chat.id)
-            if via_command:
-                await message.reply_text("That game just ended. Start a new one with /new.")
-            return True
-        previous = next(
-            (entry for entry in guess_entries(game) if str(entry.get("g", "")) == guess), None)
-        if previous:
-            await message.reply_text(
-                f"🔁 {mention(user.id, user.full_name)} already tried "
-                f"<code>{guess.upper()}</code>:\n\n{format_guess(previous)}\n"
-                "<i>Try a different word — duplicates do not use an attempt.</i>",
-                parse_mode=ParseMode.HTML)
-            return True
-        answer = str(game["word"])
-        hint = score_guess(guess, answer)
-        entry = {"g": guess, "u": user.id, "n": user.full_name or "player",
-                 "h": hint, "at": time.time()}
-        count = await db.run(db.append_guess, chat.id, entry)
-        invalidate_game(chat.id)
-        if count is None:
-            if via_command:
-                await message.reply_text("That game just ended. Start another with /new.")
-            return True
-        who = mention(user.id, user.full_name)
-
-    if guess == answer:
-        await db.run(db.finish_game, chat.id, "won")
-        invalidate_game(chat.id)
-        total = await db.run(db.record_win, chat.id, user.id, user.full_name or "")
-        await message.reply_text(
-            f"🏆 <b>{who} solved it!</b>\n\n{format_guess(entry)}\n\n"
-            f"The word was <b>{esc(answer.upper())}</b> · solved in "
-            f"<b>{count}/{cfg.max_guesses}</b> attempts.\n"
-            f"Career wins in this chat: <b>{total}</b>.\n"
-            "Start another with /new · /new4 · /new5 · /new6.",
-            parse_mode=ParseMode.HTML)
-    elif count >= cfg.max_guesses:
-        await db.run(db.finish_game, chat.id, "exhausted")
-        invalidate_game(chat.id)
-        await message.reply_text(
-            f"🛑 <b>No attempts left — round over!</b>\n\n{format_guess(entry)}\n\n"
-            f"The word was <b>{esc(answer.upper())}</b>.\n"
-            "Start a new round with /new or try /hint next time.",
-            parse_mode=ParseMode.HTML)
-    else:
-        board = render_board(
-            {"guesses": safe_guesses(game.get("guesses")) + [entry]}, limit=5)
-        remaining = cfg.max_guesses - count
-        await message.reply_text(
-            f"🎯 {who} guessed <code>{guess.upper()}</code>\n\n{board}\n\n"
-            f"{HINT_LEGEND}\n"
-            f"<b>{count}/{cfg.max_guesses}</b> attempts used · <b>{remaining}</b> left "
-            "· /game · /hint", parse_mode=ParseMode.HTML)
-    return True
-
-
-async def cmd_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Explicit /guess <word> path — clearer than relying on bare words alone."""
-    payload = command_payload(update.effective_message) if update.effective_message else ""
-    if not payload:
-        await update.effective_message.reply_text(
-            "Usage: <code>/guess crane</code>. You can also type a bare word.",
-            parse_mode=ParseMode.HTML)
-        raise ApplicationHandlerStop
-    await process_guess(update, context, payload, via_command=True)
-    raise ApplicationHandlerStop
+        f"🎲 <b>New {length}-letter word game!</b>\n"
+        f"Send a {length}-letter word as a plain message to guess. "
+        f"Up to <b>{cfg.max_guesses}</b> guesses — first correct guess wins.\n\n{HINT_LEGEND}",
+        parse_mode=ParseMode.HTML)
 
 
 async def on_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2074,130 +1602,68 @@ async def on_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
     if not message or not message.text or message.text.startswith("/") or not user or user.is_bot:
         return
-    consumed = await process_guess(update, context, message.text, via_command=False)
-    if consumed:
-        raise ApplicationHandlerStop
+    cfg, db = state(context)
+    game = await db.run(db.get_game, chat.id)
+    if not game or game["status"] != "active":
+        return
+    guess = message.text.strip().lower()
+    if not re.fullmatch(r"[a-z]+", guess) or len(guess) != int(game["length"]):
+        return  # ordinary chat, let later groups process it
+    hint = score_guess(guess, str(game["word"]))
+    entry = {"g": guess, "u": user.id, "n": user.full_name, "h": hint, "at": time.time()}
+    count = await db.run(db.append_guess, chat.id, entry)
+    if count is None:
+        return
+    who = mention(user.id, user.full_name)
+    answer = str(game["word"])
+    if guess == answer:
+        await db.run(db.finish_game, chat.id, "won")
+        total = await db.run(db.record_win, chat.id, user.id, user.full_name or "")
+        await message.reply_text(
+            f"🏆 {who} solved it in <b>{count}</b> guess(es)!\n"
+            f"<code>{guess.upper()}  {hint}</code>\n"
+            f"The word was <b>{esc(answer.upper())}</b> · career wins: {total}.\n"
+            "Start another round with /new.", parse_mode=ParseMode.HTML)
+    elif count >= cfg.max_guesses:
+        await db.run(db.finish_game, chat.id, "exhausted")
+        await message.reply_text(
+            f"🛑 <b>{cfg.max_guesses} guesses used — game over!</b>\n"
+            f"<code>{guess.upper()}  {hint}</code>\n"
+            f"The word was <b>{esc(answer.upper())}</b>. Use /new to retry.",
+            parse_mode=ParseMode.HTML)
+    else:
+        await message.reply_text(
+            f"<code>{guess.upper()}  {hint}</code>\n"
+            f"<i>Guess {count}/{cfg.max_guesses} · {HINT_LEGEND}</i>",
+            parse_mode=ParseMode.HTML)
+    raise ApplicationHandlerStop
 
 
 async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg, db = state(context)
-    message = update.effective_message
     game = await db.run(db.get_game, update.effective_chat.id)
-    if not game or game.get("status") != "active":
-        await message.reply_text(
-            "No active game. Start one with /new, /new4, /new5 or /new6.")
+    if not game or game["status"] != "active":
+        await update.effective_message.reply_text("No active game. Start one with /new, /new4, /new5 or /new6.")
         return
-    if game_is_expired(game):
-        await db.run(db.finish_game, update.effective_chat.id, "expired")
-        invalidate_game(update.effective_chat.id)
-        await message.reply_text(
-            f"⌛ That round expired and the word was "
-            f"<b>{esc(str(game['word']).upper())}</b>. Start another with /new.",
-            parse_mode=ParseMode.HTML)
-        return
-    guesses = guess_entries(game)
-    hints = hint_entries(game)
-    used = len(guesses) + len(hints)
-    hint_line = ""
-    if hints:
-        hint_line = "\n\n💡 <b>Revealed</b>: " + " · ".join(
-            f"position {int(h.get('p', 0)) + 1} = <code>{esc(str(h.get('ch', '?')).upper())}</code>"
-            for h in hints)
-    await message.reply_text(
-        f"🎯 <b>Active {game['length']}-letter game</b>\n"
-        f"<b>{used}/{cfg.max_guesses}</b> attempts used · "
-        f"<b>{max(0, cfg.max_guesses - used)}</b> remaining\n\n"
-        f"{render_board(game, limit=8)}{hint_line}\n\n"
-        f"{HINT_LEGEND}\n"
-        f"Guess with <code>/guess word</code> or a bare {game['length']}-letter word.",
-        parse_mode=ParseMode.HTML)
+    guesses = json.loads(game["guesses"] or "[]")
+    history = "\n".join(f"<code>{esc(g['g'].upper())}  {g['h']}</code>" for g in guesses[-6:])
+    await update.effective_message.reply_text(
+        f"🎯 <b>Active {game['length']}-letter game</b> · "
+        f"{len(guesses)}/{cfg.max_guesses} guesses used.\n"
+        f"{history or '<i>No guesses yet.</i>'}\n{HINT_LEGEND}", parse_mode=ParseMode.HTML)
 
 
-async def cmd_hint(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reveal one as-yet-hidden position. Each hint costs one attempt."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or not user:
+async def cmd_stopgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context, "stop games"):
         return
-    cfg, db = state(context)
-    error = ""
-    count = 0
-    position = -1
-    letter = ""
-    used_hints = 0
-    lock = GAME_LOCKS.setdefault(chat.id, asyncio.Lock())
-    async with lock:
-        game = await db.run(db.get_game, chat.id)
-        if not game or game.get("status") != "active":
-            error = "There is no active game. Start one with /new."
-        elif game_is_expired(game):
-            await db.run(db.finish_game, chat.id, "expired")
-            invalidate_game(chat.id)
-            error = f"That round expired. The word was {str(game['word']).upper()}."
-        else:
-            hints = hint_entries(game)
-            used_hints = len(hints)
-            if used_hints >= MAX_HINTS:
-                error = f"All {MAX_HINTS} hints for this round have been used."
-            else:
-                length = int(game.get("length") or 5)
-                revealed = {int(h.get("p", -1)) for h in hints if str(h.get("p", "")).isdigit()}
-                available = [index for index in range(length) if index not in revealed]
-                if not available:
-                    error = "Every position has already been revealed."
-                else:
-                    position = secrets.choice(available)
-                    letter = str(game["word"])[position]
-                    count = await db.run(db.append_guess, chat.id, {
-                        "t": "hint", "p": position, "ch": letter,
-                        "u": user.id, "n": user.full_name or "player", "at": time.time(),
-                    })
-                    invalidate_game(chat.id)
-                    if count is None:
-                        error = "That game just ended. Start another with /new."
-    if error:
-        await message.reply_text(f"💡 {esc(error)}")
+    _, db = state(context)
+    game = await db.run(db.get_game, update.effective_chat.id)
+    if not game or game["status"] != "active":
+        await update.effective_message.reply_text("There is no active game.")
         return
-    if count >= cfg.max_guesses:
-        game = await db.run(db.get_game, chat.id)
-        answer = str(game["word"]).upper() if game else "?"
-        await db.run(db.finish_game, chat.id, "exhausted")
-        invalidate_game(chat.id)
-        await message.reply_text(
-            f"💡 Position <b>{position + 1}</b> is <code>{esc(letter.upper())}</code>.\n"
-            f"🛑 That hint used the last attempt — the word was "
-            f"<b>{esc(answer)}</b>.\nStart a new round with /new.",
-            parse_mode=ParseMode.HTML)
-        return
-    await message.reply_text(
-        f"💡 <b>Hint {used_hints + 1}/{MAX_HINTS}</b> for "
-        f"{mention(user.id, user.full_name)}\n"
-        f"Position <b>{position + 1}</b> is <code>{esc(letter.upper())}</code>.\n"
-        f"<i>Hints cost one attempt.</i> · <b>{count}/{cfg.max_guesses}</b> used.",
-        parse_mode=ParseMode.HTML)
-
-
-async def cmd_giveup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Reveal the answer. Allowed for the round starter, admins and owners."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or not user:
-        return
-    cfg, db = state(context)
-    game = await db.run(db.get_game, chat.id)
-    if not game or game.get("status") != "active":
-        await message.reply_text("There is no active game.")
-        return
-    privileged = await is_privileged(bot_of(context), chat.id, user.id, cfg)
-    if user.id != int(game.get("started_by") or 0) and not privileged:
-        await message.reply_text("Only the player who started this round or an admin "
-                                 "can end it.")
-        return
-    await db.run(db.finish_game, chat.id, "given_up")
-    invalidate_game(chat.id)
-    used = len(guess_entries(game)) + len(hint_entries(game))
-    await message.reply_text(
-        f"🛑 <b>Round ended by request.</b>\n"
-        f"The word was <b>{esc(str(game['word']).upper())}</b> · "
-        f"{used}/{cfg.max_guesses} attempts used.\nStart another with /new.",
+    await db.run(db.finish_game, update.effective_chat.id, "stopped")
+    await update.effective_message.reply_text(
+        f"🛑 Game stopped. The word was <b>{esc(str(game['word']).upper())}</b>.",
         parse_mode=ParseMode.HTML)
 
 
@@ -2205,18 +1671,12 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, db = state(context)
     rows = await db.run(db.leaderboard, update.effective_chat.id, 5)
     if not rows:
-        await update.effective_message.reply_text(
-            "No winners yet. Start a game with /new and be the first to solve it!")
+        await update.effective_message.reply_text("No winners yet. Start a game with /new!")
         return
-    medals = ("🥇", "🥈", "🥉", "🎖️", "🎖️")
-    lines = [
-        f"{medals[index]} {mention(int(row['user_id']), row['name'])} — "
-        f"<b>{row['wins']}</b> win(s)"
-        for index, row in enumerate(rows)
-    ]
-    await update.effective_message.reply_text(
-        "🏅 <b>Top guessers in this chat</b>\n" + "\n".join(lines),
-        parse_mode=ParseMode.HTML)
+    lines = [f"{i}. {mention(int(r['user_id']), r['name'])} — <b>{r['wins']}</b> win(s)"
+             for i, r in enumerate(rows, 1)]
+    await update.effective_message.reply_text("🏅 <b>Top guessers</b>\n" + "\n".join(lines),
+                                              parse_mode=ParseMode.HTML)
 
 
 # --------------------------------------------------------------------------- #
@@ -2235,23 +1695,13 @@ HELP_TEXT = """<b>Miss Sona — command list</b>
 /shadowreply &lt;text&gt; — repost as the bot (admin/owner)
 @all [message] / @admin [message] — paced mentions (admin)
 
-<b>Banned-word vault (bot owner only)</b>
-/bannedwords — view the shared list (sent privately from groups)
-/addword word1, word2 — add words to every group
-/delword word — remove words · /setwords word1, word2 — replace all
-/clearbannedwords — empty the vault (persists across restarts)
-
 <b>Game</b>
-/new /new4 /new5 /new6 — start a round (30 attempts)
-/guess &lt;word&gt; — submit an explicit guess (bare words also work)
-/hint — reveal a position (max 3; costs one attempt)
-/game — board &amp; remaining attempts · /top — leaderboard
-/giveup or /stopgame — reveal the answer (starter/admin)
+/new /new4 /new5 /new6 /game /stopgame /top
+Send a plain word of the right length to guess.
 🎯 exact · 🔀 wrong spot · 🚫 absent
 
-<b>Info &amp; troubleshooting</b>
-/start /help /ping /id /myid /diag
-/diag checks my admin rights, privacy mode and OWNER_IDS.
+<b>Info</b>
+/start /help /ping /id
 
 New members must complete the 2-minute captcha. Unapproved links and
 prohibited text (including text inside images) are removed automatically."""
@@ -2271,12 +1721,10 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, db = state(context)
     stats = await db.run(db.dashboard, update.effective_chat.id)
-    banned = await db.run(db.count_banned_words)
     await update.effective_message.reply_text(
         "🏓 <b>pong</b> — polling, database and handlers healthy.\n"
         f"<i>{stats['notes']} notes · {stats['warned']} warned users · "
-        f"{stats['active']} tracked members · {banned} global banned words</i>",
-        parse_mode=ParseMode.HTML)
+        f"{stats['active']} tracked members</i>", parse_mode=ParseMode.HTML)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2285,71 +1733,6 @@ async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"🆔 <b>Chat:</b> <code>{chat.id}</code> ({esc(chat.type)})\n"
         f"<b>You:</b> <code>{user.id}</code> ({esc(user.full_name)})",
         parse_mode=ParseMode.HTML)
-
-
-async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Self-check: bot rights, admin verification, owners and privacy mode.
-
-    This command exists because "commands do nothing" is almost always one of:
-    (1) the bot is not an admin, (2) privacy mode is enabled, or (3) OWNER_IDS
-    is empty. It reports all three without exposing any secrets.
-    """
-    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
-    if not chat or not user or not message:
-        return
-    cfg, _ = state(context)
-    bot = bot_of(context)
-    lines = [
-        "🩺 <b>Miss Sona diagnostics</b>",
-        f"<b>Chat</b>: <code>{chat.id}</code> · <code>{esc(chat.type)}</code>",
-        f"<b>Your ID</b>: <code>{user.id}</code>",
-        f"<b>OWNER_IDS configured</b>: <b>{len(cfg.owner_ids)}</b>",
-    ]
-    if user.id in cfg.owner_ids:
-        lines.append("✅ You are a configured bot owner.")
-    elif not cfg.owner_ids:
-        lines.append(
-            "⚠️ <b>No owners configured.</b> Add this to the bot's environment, "
-            "then restart:\n"
-            f"<code>OWNER_IDS={user.id}</code>\n"
-            "<i>Keep OWNER_IDS as a host secret; never post your token.</i>")
-    if chat.type in GROUP_TYPES:
-        try:
-            me = await bot.get_chat_member(chat.id, bot.id)
-            status = str(getattr(me, "status", "unknown"))
-            lines.append(f"<b>Bot status</b>: <code>{esc(status)}</code>")
-            if status == OWNER_STATUS:
-                lines.append("✅ I am the group creator: full rights.")
-            elif status in ADMIN_STATUSES:
-                checks = (
-                    ("can_delete_messages", "delete messages"),
-                    ("can_restrict_members", "restrict / ban"),
-                    ("can_promote_members", "promote admins"),
-                    ("can_invite_users", "invite users"),
-                )
-                granted = [label for attr, label in checks if getattr(me, attr, False)]
-                missing = [label for attr, label in checks if not getattr(me, attr, False)]
-                lines.append("<b>Rights</b>: " + (esc(", ".join(granted)) or "none"))
-                if missing:
-                    lines.append("❌ <b>Missing</b>: " + esc(", ".join(missing)))
-                else:
-                    lines.append("✅ All moderation rights are present.")
-            else:
-                lines.append("❌ <b>I am not an admin.</b> Promote me with "
-                             "Delete messages, Ban users and Restrict members.")
-        except TelegramError as exc:
-            lines.append(f"⚠️ Could not read my membership: <code>{esc(str(exc))[:160]}</code>")
-        try:
-            member = await bot.get_chat_member(chat.id, user.id)
-            lines.append(f"<b>Your status</b>: <code>{esc(getattr(member, 'status', '?'))}</code>")
-        except TelegramError as exc:
-            logger.debug("diag member lookup failed: %s", exc)
-        lines.append(
-            "📡 If slash commands get no reply at all, disable privacy mode in "
-            "@BotFather (<code>/setprivacy → Disable</code>) and restart polling.")
-    else:
-        lines.append("💬 Private chat: commands work here; moderation needs a group.")
-    await send_long(bot, chat.id, "\n".join(lines))
 
 
 async def on_any_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2389,13 +1772,6 @@ async def post_init(application: Application) -> None:
     if cfg.tesseract_cmd and OCR_AVAILABLE and pytesseract is not None:
         pytesseract.pytesseract.tesseract_cmd = cfg.tesseract_cmd
     await db.run(db.init_schema)
-    # The database is authoritative. BANNED_WORDS seeds an empty vault once.
-    seeded = await db.run(db.seed_banned_words, cfg.banned_words, 0)
-    words = await refresh_matcher(application)
-    if application.job_queue:
-        application.job_queue.run_repeating(
-            refresh_banned_words_job, interval=300, first=300,
-            name="banned-words-refresh")
     # Restart safety: re-arm timeouts for users still awaiting verification.
     pending = await db.run(db.pending_captchas)
     now = time.time()
@@ -2404,15 +1780,8 @@ async def post_init(application: Application) -> None:
         schedule_captcha_timeout(application, int(row["chat_id"]), int(row["user_id"]),
                                  str(row["token"]), remaining)
     me = await application.bot.get_me()
-    if not cfg.owner_ids:
-        logger.warning(
-            "OWNER_IDS is EMPTY: owner-only vault commands are locked. "
-            "Send /id to @%s, then set OWNER_IDS=<your numeric id> and restart. "
-            "Group admins are unaffected and can use /diag.", me.username)
-    logger.info("Miss Sona @%s ready | OCR=%s | DB=%s | banned words=%d%s | "
-                "pending captchas=%d | owners=%d",
+    logger.info("Miss Sona @%s ready | OCR=%s | DB=%s | pending captchas=%d | owners=%d",
                 me.username, "on" if OCR_AVAILABLE else "off", cfg.db_path,
-                len(words), " (seeded from env)" if seeded else "",
                 len(pending), len(cfg.owner_ids))
 
 
@@ -2434,7 +1803,6 @@ def register_handlers(application: Application, cfg: Config) -> None:
 
     public_commands = {
         "start": cmd_start, "help": cmd_help, "ping": cmd_ping, "id": cmd_id,
-        "myid": cmd_id, "diag": cmd_diag,
     }
     group_commands = {
         "ban": cmd_ban, "unban": cmd_unban, "mute": cmd_mute, "unmute": cmd_unmute,
@@ -2444,24 +1812,12 @@ def register_handlers(application: Application, cfg: Config) -> None:
         "trust": cmd_trust, "untrust": cmd_untrust,
         "shadowreply": cmd_shadowreply,
         "new": cmd_new, "new4": cmd_new, "new5": cmd_new, "new6": cmd_new,
-        "guess": cmd_guess, "hint": cmd_hint, "game": cmd_game,
-        "giveup": cmd_giveup, "stopgame": cmd_giveup, "top": cmd_top,
+        "game": cmd_game, "stopgame": cmd_stopgame, "top": cmd_top,
     }
     for name, handler in public_commands.items():
         application.add_handler(CommandHandler(name, handler), group=0)
     for name, handler in group_commands.items():
         application.add_handler(CommandHandler(name, handler, filters=groups), group=0)
-
-    # Owner-only vault commands work in private chat and in groups.
-    owner_commands = {
-        "bannedwords": cmd_bannedwords,
-        "addword": cmd_addword,
-        "delword": cmd_delword,
-        "setwords": cmd_setwords,
-        "clearbannedwords": cmd_clearbannedwords,
-    }
-    for name, handler in owner_commands.items():
-        application.add_handler(CommandHandler(name, handler), group=0)
 
     application.add_handler(CallbackQueryHandler(on_captcha_button, pattern=r"^cv:"), group=0)
     application.add_handler(
@@ -2479,9 +1835,7 @@ def register_handlers(application: Application, cfg: Config) -> None:
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.IMAGE),
         on_group_message), group=4)
     logger.info("Registered %d command handlers in 6 handler groups",
-                len(public_commands) + len(group_commands) + len(owner_commands))
-    logger.info("Game engine ready: /guess, /hint, /giveup, /game, /top "
-                "(%d attempts, %d hints)", cfg.max_guesses, MAX_HINTS)
+                len(public_commands) + len(group_commands))
 
 
 def main() -> None:
