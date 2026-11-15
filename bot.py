@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Sentinel - all-in-one Telegram group management and gaming bot.
+Miss Sona - all-in-one Telegram group management and gaming bot.
 
 Single-file deployment blueprint built on python-telegram-bot v20+/v21.x.
 
@@ -15,7 +15,9 @@ Modules
 3. Admin broadcasts         : cooldown + lock throttled @all / @admin HTML
                               mentions with a safe 3-second pacing interval.
 4. Captcha verification     : restrict on join, inline button, JobQueue timeout.
-5. Shadow-reply             : delete admin command, resend payload as the bot.
+5. Shadow-reply             : group owner and bot owner always allowed; other
+                              admins need /addshadow approval. The command is
+                              deleted and its payload reposted as the bot.
 6. Word jumble game         : /new /new4 /new5 /new6, 30 guesses, icon hints.
 
 Quick start
@@ -92,7 +94,7 @@ except ImportError:  # The bot still runs; OCR simply degrades to a warning.
     UnidentifiedImageError = OSError  # type: ignore[assignment,misc]
     pytesseract = None  # type: ignore[assignment]
 
-logger = logging.getLogger("sentinel")
+logger = logging.getLogger("miss_sona")
 
 DEFAULT_BANNED_WORDS = (
     "porn", "xxx", "nsfw", "escort", "phishing", "airdrop-scam",
@@ -360,8 +362,16 @@ CREATE TABLE IF NOT EXISTS wins (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS shadow_approvals (
+    chat_id      INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    approved_by  INTEGER NOT NULL,
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
 CREATE INDEX IF NOT EXISTS idx_activity_seen ON activity (chat_id, last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_wins_chat ON wins (chat_id, wins DESC);
+CREATE INDEX IF NOT EXISTS idx_shadow_chat ON shadow_approvals (chat_id);
 """
 
 
@@ -507,6 +517,40 @@ class Database:
     def is_link_trusted(self, chat_id: int, user_id: int) -> bool:
         return self._query("SELECT 1 FROM link_trust WHERE chat_id=? AND user_id=?",
                            (chat_id, user_id), fetch="one") is not None
+
+    # -- shadow reply approvals --------------------------------------------
+    def set_shadow_approval(self, chat_id: int, user_id: int, approved_by: int) -> None:
+        self._query(
+            "INSERT INTO shadow_approvals (chat_id, user_id, approved_by, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+            "approved_by=excluded.approved_by, created_at=excluded.created_at",
+            (chat_id, user_id, approved_by, time.time()),
+        )
+
+    def remove_shadow_approval(self, chat_id: int, user_id: int) -> bool:
+        with self._lock:
+            conn = self._connect()
+            cursor = conn.execute(
+                "DELETE FROM shadow_approvals WHERE chat_id=? AND user_id=?",
+                (chat_id, user_id),
+            )
+            conn.commit()
+            return cursor.rowcount > 0
+
+    def is_shadow_approved(self, chat_id: int, user_id: int) -> bool:
+        return self._query(
+            "SELECT 1 FROM shadow_approvals WHERE chat_id=? AND user_id=?",
+            (chat_id, user_id), fetch="one",
+        ) is not None
+
+    def list_shadow_approvals(self, chat_id: int) -> list[dict]:
+        return self._query(
+            "SELECT s.user_id, s.approved_by, s.created_at, "
+            "COALESCE(a.name, '') AS name, COALESCE(a.username, '') AS username "
+            "FROM shadow_approvals s "
+            "LEFT JOIN activity a ON a.chat_id=s.chat_id AND a.user_id=s.user_id "
+            "WHERE s.chat_id=? ORDER BY s.created_at", (chat_id,), fetch="all",
+        ) or []
 
     # -- activity -----------------------------------------------------------
     def touch_activity(self, chat_id: int, user: Any) -> None:
@@ -731,6 +775,51 @@ async def is_admin(bot, chat_id: int, user_id: int, ttl: float = 45.0) -> bool:
 
 async def is_privileged(bot, chat_id: int, user_id: int, cfg: Config) -> bool:
     return user_id in cfg.owner_ids or await is_admin(bot, chat_id, user_id)
+
+
+async def is_chat_creator(bot, chat_id: int, user_id: int) -> bool:
+    """Live group-owner check (not cached, so ownership changes apply at once)."""
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        return member.status == ChatMemberStatus.CREATOR
+    except TelegramError as exc:
+        logger.debug("Creator lookup failed for %s in %s: %s", user_id, chat_id, exc)
+        return False
+
+
+async def shadow_role(bot, db: Database, chat_id: int, user_id: int,
+                      cfg: Config) -> Optional[str]:
+    """Return why a user may use /shadowreply, or None when unapproved.
+
+    The configured bot owner(s) and the group owner always have access.
+    Every other group admin must be explicitly approved with /addshadow.
+    """
+    if user_id in cfg.owner_ids:
+        return "bot owner"
+    if await is_chat_creator(bot, chat_id, user_id):
+        return "group owner"
+    if await db.run(db.is_shadow_approved, chat_id, user_id) and \
+            await is_admin(bot, chat_id, user_id):
+        return "approved admin"
+    return None
+
+
+async def require_shadow_approver(update: Update,
+                                  context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Approval is restricted to the group owner (creator) or a bot owner."""
+    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or not user or not message:
+        return False
+    if chat.type not in GROUP_TYPES:
+        await message.reply_text("Shadow approvals only work inside groups.")
+        return False
+    cfg, _ = state(context)
+    if user.id in cfg.owner_ids or await is_chat_creator(bot_of(context), chat.id, user.id):
+        return True
+    await message.reply_text(
+        "🔒 Only the <b>group owner</b> or the <b>bot owner</b> can approve or revoke "
+        "shadow-reply admins.", parse_mode=ParseMode.HTML)
+    return False
 
 
 async def default_permissions(bot, chat_id: int) -> ChatPermissions:
@@ -1412,13 +1501,19 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not change or not change.new_chat_member:
         return
     old, new = change.old_chat_member, change.new_chat_member
+    chat, user = change.chat, new.user
+    cfg, db = state(context)
+    # Security: a demoted/removed admin immediately loses shadow-reply approval.
+    if old.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR) and \
+            new.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
+        await db.run(db.remove_shadow_approval, chat.id, user.id)
+        logger.info("shadow approval auto-revoked after demotion chat=%s user=%s",
+                    chat.id, user.id)
     if memberish(old) or not memberish(new):
         return
-    user, chat = new.user, change.chat
-    if user.is_bot or user.id in state(context)[0].owner_ids:
+    if user.is_bot or user.id in cfg.owner_ids:
         return
     bot = bot_of(context)
-    cfg, db = state(context)
     try:
         await bot.restrict_chat_member(chat_id=chat.id, user_id=user.id,
                                        permissions=ChatPermissions.no_permissions())
@@ -1492,13 +1587,119 @@ async def on_captcha_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # --------------------------------------------------------------------------- #
-# 5. Shadow-reply / proxy messaging                                            #
+# 5. Shadow-reply approvals + proxy messaging                                  #
 # --------------------------------------------------------------------------- #
 
+async def cmd_addshadow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group owner / bot owner: approve one current admin for /shadowreply."""
+    if not await require_shadow_approver(update, context):
+        return
+    message, chat = update.effective_message, update.effective_chat
+    cfg, db = state(context)
+    bot = bot_of(context)
+    target_id, name = await resolve_target(update, context)
+    if target_id is None:
+        await message.reply_text(
+            "Usage: reply to an admin with <code>/addshadow</code>, "
+            "or use <code>/addshadow 123456789</code>.", parse_mode=ParseMode.HTML)
+        return
+    if target_id == getattr(bot, "id", None):
+        await message.reply_text("The bot already speaks as itself 🙂")
+        return
+    if target_id in cfg.owner_ids or await is_chat_creator(bot, chat.id, target_id):
+        await message.reply_text(
+            f"ℹ️ {mention(target_id, name)} is a bot owner or the group owner and "
+            "already has shadow-reply access by default.", parse_mode=ParseMode.HTML)
+        return
+    # ttl=0 forces a fresh lookup: a just-promoted admin must be approvable now.
+    if not await is_admin(bot, chat.id, target_id, ttl=0.0):
+        await message.reply_text(
+            "Only current group administrators can be approved for shadow reply. "
+            "Promote this member first.", parse_mode=ParseMode.HTML)
+        return
+    await db.run(db.set_shadow_approval, chat.id, target_id, update.effective_user.id)
+    await message.reply_text(
+        f"✅ {mention(target_id, name)} approved for <b>shadow reply</b>.\n"
+        "<i>They can now use /shadowreply. Revoke with /removeshadow.</i>",
+        parse_mode=ParseMode.HTML)
+    logger.info("shadow approval chat=%s target=%s by=%s", chat.id, target_id,
+                update.effective_user.id)
+
+
+async def cmd_removeshadow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group owner / bot owner: revoke an admin's individually granted access."""
+    if not await require_shadow_approver(update, context):
+        return
+    message, chat = update.effective_message, update.effective_chat
+    cfg, db = state(context)
+    bot = bot_of(context)
+    target_id, name = await resolve_target(update, context)
+    if target_id is None:
+        await message.reply_text(
+            "Usage: reply to an approved admin with <code>/removeshadow</code>.",
+            parse_mode=ParseMode.HTML)
+        return
+    if target_id in cfg.owner_ids or await is_chat_creator(bot, chat.id, target_id):
+        await message.reply_text(
+            "The bot owner and group owner have built-in shadow-reply access "
+            "and cannot be revoked here.", parse_mode=ParseMode.HTML)
+        return
+    removed = await db.run(db.remove_shadow_approval, chat.id, target_id)
+    if removed:
+        text = f"🗑️ Shadow-reply access revoked for {mention(target_id, name)}."
+        logger.info("shadow revoked chat=%s target=%s by=%s", chat.id, target_id,
+                    update.effective_user.id)
+    else:
+        text = f"{mention(target_id, name)} was not individually approved."
+    await message.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_shadowadmins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group owner / bot owner: show built-in and approved shadow operators."""
+    if not await require_shadow_approver(update, context):
+        return
+    chat = update.effective_chat
+    cfg, db = state(context)
+    bot = bot_of(context)
+    lines = ["🕶️ <b>Shadow-reply access</b>", "", "<b>Built-in (always allowed)</b>"]
+    try:
+        admins = await bot.get_chat_administrators(chat.id)
+        for admin in admins:
+            if admin.status == ChatMemberStatus.CREATOR and admin.user:
+                lines.append("• " + mention(admin.user.id, admin.user.full_name) + " — group owner")
+    except TelegramError as exc:
+        logger.debug("Could not read group owner in %s: %s", chat.id, exc)
+    for owner_id in sorted(cfg.owner_ids)[:10]:
+        lines.append("• " + mention(owner_id, "Bot owner") + f" — <code>{owner_id}</code>")
+    approved = await db.run(db.list_shadow_approvals, chat.id)
+    lines.append("")
+    lines.append("<b>Approved admins</b>" if approved else "<b>Approved admins:</b> none yet")
+    for row in approved:
+        label = row["name"] or row["username"] or str(row["user_id"])
+        lines.append("• " + mention(int(row["user_id"]), label))
+    lines.append("")
+    lines.append("<i>Approve with /addshadow (reply to an admin) · revoke with /removeshadow.</i>")
+    await send_long(bot, chat.id, "\n".join(lines))
+
+
 async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete the admin's command and republish the payload as the bot itself."""
+    """Delete the command and republish the payload as the bot itself.
+
+    The group owner and configured bot owner(s) are always allowed. A regular
+    group admin must first be approved by the owner with /addshadow.
+    """
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not await require_admin(update, context, "use shadow replies"):
+    if chat.type not in GROUP_TYPES:
+        await message.reply_text("Shadow reply only works in groups.")
+        return
+    cfg, db = state(context)
+    bot = bot_of(context)
+    role = await shadow_role(bot, db, chat.id, user.id, cfg)
+    if role is None:
+        await message.reply_text(
+            f"🔒 <b>Shadow reply is locked</b> for {mention(user.id, user.full_name)}.\n"
+            "The <b>group owner</b> or <b>bot owner</b> must approve you with "
+            "<code>/addshadow</code> first.", parse_mode=ParseMode.HTML)
         return
     raw_html = getattr(message, "text_html", None) or esc(message.text or "")
     # Strip only the leading command (including an optional @BotUsername).
@@ -1513,7 +1714,6 @@ async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("⏳ Please wait a moment before another shadow reply.")
         return
     SHADOW_LAST[user.id] = time.monotonic()
-    bot = bot_of(context)
     await safe_delete(bot, chat.id, message.message_id)
     try:
         # Sent by the bot's own identity: the original admin is not the author.
@@ -1521,7 +1721,7 @@ async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except BadRequest:
         # Fallback for exotic entity combinations: resend as plain text.
         await bot.send_message(chat_id=chat.id, text=command_payload(message))
-    logger.info("shadow reply chat=%s by=%s", chat.id, user.id)
+    logger.info("shadow reply chat=%s by=%s role=%s", chat.id, user.id, role)
 
 
 # --------------------------------------------------------------------------- #
@@ -1661,7 +1861,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Utility commands + lifecycle                                                 #
 # --------------------------------------------------------------------------- #
 
-HELP_TEXT = """<b>Sentinel — command list</b>
+HELP_TEXT = """<b>Miss Sona — command list</b>
 
 <b>Moderation (admin)</b>
 /ban /unban /mute /unmute /warn /warns /trust /untrust
@@ -1670,7 +1870,8 @@ HELP_TEXT = """<b>Sentinel — command list</b>
 /setrules /rules /setnote /note /notes /delnote
 
 <b>Announcements</b>
-/shadowreply &lt;text&gt; — repost as the bot (admin/owner)
+/addshadow /removeshadow /shadowadmins — owner-only access control
+/shadowreply &lt;text&gt; — repost as the bot (owner or approved admin)
 @all [message] / @admin [message] — paced mentions (admin)
 
 <b>Game</b>
@@ -1682,12 +1883,15 @@ Send a plain word of the right length to guess.
 /start /help /ping /id
 
 New members must complete the 2-minute captcha. Unapproved links and
-prohibited text (including text inside images) are removed automatically."""
+prohibited text (including text inside images) are removed automatically.
+
+The group owner and bot owner always have shadow reply. Other group admins
+must be approved with /addshadow before /shadowreply will work."""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "👋 <b>Sentinel online.</b>\nI handle moderation, rules, notes, anti-spam, "
+        "👋 <b>Miss Sona online.</b>\nI handle moderation, rules, notes, anti-spam, "
         "captcha, broadcasts and word games.\nUse /help for the full command list.",
         parse_mode=ParseMode.HTML)
 
@@ -1737,7 +1941,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     cfg = context.application.bot_data.get("cfg")
     if cfg and cfg.error_chat_id:
         try:
-            text = f"⚠️ <b>Sentinel error</b>\n<code>{esc(str(err))[:800]}</code>"
+            text = f"⚠️ <b>Miss Sona error</b>\n<code>{esc(str(err))[:800]}</code>"
             await context.application.bot.send_message(cfg.error_chat_id, text,
                                                        parse_mode=ParseMode.HTML)
         except TelegramError:
@@ -1757,8 +1961,12 @@ async def post_init(application: Application) -> None:
         remaining = max(1.0, float(cfg.captcha_timeout) - (now - float(row["created_at"])))
         schedule_captcha_timeout(application, int(row["chat_id"]), int(row["user_id"]),
                                  str(row["token"]), remaining)
+    try:
+        await application.bot.set_my_name(name="Miss Sona")
+    except TelegramError as exc:
+        logger.warning("Could not set Telegram display name to Miss Sona: %s", exc)
     me = await application.bot.get_me()
-    logger.info("Sentinel @%s ready | OCR=%s | DB=%s | pending captchas=%d | owners=%d",
+    logger.info("Miss Sona @%s ready | OCR=%s | DB=%s | pending captchas=%d | owners=%d",
                 me.username, "on" if OCR_AVAILABLE else "off", cfg.db_path,
                 len(pending), len(cfg.owner_ids))
 
@@ -1768,7 +1976,7 @@ async def post_shutdown(application: Application) -> None:
     await db.run(db.close)
     for task in list(BACKGROUND_TASKS):
         task.cancel()
-    logger.info("Sentinel shutdown complete")
+    logger.info("Miss Sona shutdown complete")
 
 
 def register_handlers(application: Application, cfg: Config) -> None:
@@ -1789,6 +1997,8 @@ def register_handlers(application: Application, cfg: Config) -> None:
         "setnote": cmd_setnote, "note": cmd_note, "notes": cmd_notes, "delnote": cmd_delnote,
         "trust": cmd_trust, "untrust": cmd_untrust,
         "shadowreply": cmd_shadowreply,
+        "addshadow": cmd_addshadow, "removeshadow": cmd_removeshadow,
+        "shadowadmins": cmd_shadowadmins,
         "new": cmd_new, "new4": cmd_new, "new5": cmd_new, "new6": cmd_new,
         "game": cmd_game, "stopgame": cmd_stopgame, "top": cmd_top,
     }
@@ -1844,7 +2054,7 @@ def main() -> None:
     register_handlers(application, cfg)
     application.add_error_handler(error_handler)
 
-    logger.info("Starting Sentinel (python-telegram-bot, long polling)…")
+    logger.info("Starting Miss Sona (python-telegram-bot, long polling)…")
     # ALL_TYPES is required: chat_member updates drive the captcha gate.
     application.run_polling(
         allowed_updates=Update.ALL_TYPES,
