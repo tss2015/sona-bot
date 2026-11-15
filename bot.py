@@ -3,8 +3,7 @@
 """
 Miss Sona - all-in-one Telegram group management and gaming bot.
 
-Single-file deployment blueprint built for python-telegram-bot v20, v21 and
-v22 (no removed status constants; raw Bot API status strings are used).
+Single-file deployment blueprint built on python-telegram-bot v20+/v21.x.
 
 Modules
 -------
@@ -14,7 +13,8 @@ Modules
                               temporary warning, keyword filtering and
                               PyTesseract OCR on images with repeat-offender bans.
 3. Admin broadcasts         : cooldown + lock throttled @all / @admin HTML
-                              mentions with a safe 3-second pacing interval.
+                              mentions. @all targets every known human member
+                              (active or dormant) and never bots, paced safely.
 4. Captcha verification     : restrict on join, inline button, JobQueue timeout.
 5. Shadow-reply             : delete admin command, resend payload as the bot.
 6. Word jumble game         : /new /new4 /new5 /new6, 30 guesses, icon hints.
@@ -68,7 +68,7 @@ except ImportError:  # pragma: no cover - env vars work without it
     pass
 
 from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatType, MessageEntityType, ParseMode
+from telegram.constants import ChatMemberStatus, ChatType, MessageEntityType, ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -83,13 +83,15 @@ from telegram.ext import (
 )
 
 try:
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
     import pytesseract
 
     OCR_AVAILABLE = True
-except ImportError:  # The bot still runs; OCR simply degrades to a warning.
+except ImportError:  # The bot still runs; OCR/welcome cards degrade gracefully.
     OCR_AVAILABLE = False
     Image = None  # type: ignore[assignment]
+    ImageDraw = None  # type: ignore[assignment]
+    ImageFont = None  # type: ignore[assignment]
     UnidentifiedImageError = OSError  # type: ignore[assignment,misc]
     pytesseract = None  # type: ignore[assignment]
 
@@ -98,6 +100,20 @@ logger = logging.getLogger("miss_sona")
 DEFAULT_BANNED_WORDS = (
     "porn", "xxx", "nsfw", "escort", "phishing", "airdrop-scam",
     "nude", "casino-spam", "crypto-doubler", "free-giftcard",
+)
+
+# Welcome / goodbye defaults. {first} and {group} resolve per member and chat.
+DEFAULT_WELCOME_TEXT = "Hey {first}, welcome to {group}! 🎉"
+DEFAULT_GOODBYE_TEXT = "Goodbye {first}, we'll miss you in {group}! 👋"
+GREETING_LIMIT = 1024
+CONNECT_TOKEN_TTL = 900  # 15 minutes, single use
+SUPPRESS_GOODBYE: set[tuple[int, int]] = set()  # bot-initiated kicks
+WELCOME_CARD_ENABLED = os.getenv("WELCOME_CARD", "1").strip().lower() not in {
+    "0", "false", "no", "off",
+}
+GREETING_PLACEHOLDERS = (
+    "{first} first name · {user} full name · {username} @username\n"
+    "{mention} clickable mention · {group} group title · {id} user ID · {count} member count"
 )
 
 # --------------------------------------------------------------------------- #
@@ -144,8 +160,7 @@ class Config:
     broadcast_cooldown: int
     mention_delay: float
     mention_batch_size: int
-    max_mentions: int
-    active_window_days: int
+    max_mentions: int  # 0 means every known member (no cap)
     max_guesses: int
     ocr_lang: str
     ocr_max_bytes: int
@@ -173,8 +188,8 @@ class Config:
             broadcast_cooldown=_env_int("BROADCAST_COOLDOWN", 300, 10, 3600),
             mention_delay=_env_float("MENTION_DELAY", 3.0, 1.0, 30.0),
             mention_batch_size=_env_int("MENTION_BATCH_SIZE", 1, 1, 20),
-            max_mentions=_env_int("MAX_MENTIONS", 40, 1, 500),
-            active_window_days=_env_int("ACTIVE_WINDOW_DAYS", 30, 1, 3650),
+            # 0 = unlimited: mention the entire known roster, active or dormant.
+            max_mentions=_env_int("MAX_MENTIONS", 0, 0, 500),
             max_guesses=_env_int("MAX_GUESSES", 30, 5, 60),
             ocr_lang=os.getenv("OCR_LANG", "eng").strip() or "eng",
             ocr_max_bytes=_env_int("OCR_MAX_BYTES", 8 * 1024 * 1024, 1024, 20 * 1024 * 1024),
@@ -326,6 +341,8 @@ CREATE TABLE IF NOT EXISTS link_trust (
     created_at  REAL NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
+-- Persistent membership roster. Rows are kept forever (activity history) but
+-- in_chat tracks presence: 1 = still in the group, 0 = left/kicked/not added.
 CREATE TABLE IF NOT EXISTS activity (
     chat_id     INTEGER NOT NULL,
     user_id     INTEGER NOT NULL,
@@ -333,6 +350,8 @@ CREATE TABLE IF NOT EXISTS activity (
     username    TEXT NOT NULL DEFAULT '',
     is_bot      INTEGER NOT NULL DEFAULT 0,
     last_seen   REAL NOT NULL,
+    in_chat     INTEGER NOT NULL DEFAULT 1,
+    joined_at   REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (chat_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS captcha (
@@ -361,8 +380,37 @@ CREATE TABLE IF NOT EXISTS wins (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
+CREATE TABLE IF NOT EXISTS greetings (
+    chat_id     INTEGER PRIMARY KEY,
+    welcome     TEXT,
+    goodbye     TEXT,
+    updated_by  INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connections (
+    user_id      INTEGER PRIMARY KEY,
+    chat_id      INTEGER NOT NULL,
+    connected_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS connect_tokens (
+    token      TEXT PRIMARY KEY,
+    chat_id    INTEGER NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS bans (
+    chat_id      INTEGER NOT NULL,
+    user_id      INTEGER NOT NULL,
+    display_name TEXT NOT NULL DEFAULT '',
+    reason       TEXT NOT NULL DEFAULT '',
+    banned_by    INTEGER NOT NULL DEFAULT 0,
+    created_at   REAL NOT NULL,
+    PRIMARY KEY (chat_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_bans_chat ON bans (chat_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_activity_seen ON activity (chat_id, last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_wins_chat ON wins (chat_id, wins DESC);
+-- idx_activity_roster is created by _migrate_schema() AFTER legacy columns exist.
 """
 
 
@@ -410,8 +458,22 @@ class Database:
         with self._lock:
             conn = self._connect()
             conn.executescript(SCHEMA_SQL)
+            self._migrate_schema(conn)
             conn.commit()
         logger.info("SQLite schema ready at %s", self.path)
+
+    @staticmethod
+    def _migrate_schema(conn: sqlite3.Connection) -> None:
+        """Idempotent upgrades for databases created by earlier versions."""
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(activity)")}
+        if "in_chat" not in columns:
+            conn.execute("ALTER TABLE activity ADD COLUMN in_chat INTEGER NOT NULL DEFAULT 1")
+            logger.info("Migrated activity: added in_chat")
+        if "joined_at" not in columns:
+            conn.execute("ALTER TABLE activity ADD COLUMN joined_at REAL NOT NULL DEFAULT 0")
+            logger.info("Migrated activity: added joined_at")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_activity_roster "
+                     "ON activity (chat_id, in_chat, is_bot)")
 
     def close(self) -> None:
         with self._lock:
@@ -509,24 +571,71 @@ class Database:
         return self._query("SELECT 1 FROM link_trust WHERE chat_id=? AND user_id=?",
                            (chat_id, user_id), fetch="one") is not None
 
-    # -- activity -----------------------------------------------------------
+    # -- membership roster --------------------------------------------------
     def touch_activity(self, chat_id: int, user: Any) -> None:
+        """A message was seen: remember the human and mark them present."""
+        now = time.time()
         self._query(
-            "INSERT INTO activity (chat_id, user_id, name, username, is_bot, last_seen) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+            "INSERT INTO activity "
+            "(chat_id, user_id, name, username, is_bot, last_seen, in_chat, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
             "name=excluded.name, username=excluded.username, is_bot=excluded.is_bot, "
-            "last_seen=excluded.last_seen",
+            "last_seen=excluded.last_seen, in_chat=1",
             (chat_id, user.id, getattr(user, "full_name", "") or "",
              (getattr(user, "username", "") or "").lower(),
-             int(bool(getattr(user, "is_bot", False))), time.time()),
+             int(bool(getattr(user, "is_bot", False))), now, now),
         )
 
-    def active_members(self, chat_id: int, since: float, limit: int) -> list[dict]:
-        return self._query(
-            "SELECT user_id, name, username FROM activity "
-            "WHERE chat_id=? AND last_seen>=? AND is_bot=0 AND user_id>0 "
-            "ORDER BY last_seen DESC LIMIT ?", (chat_id, since, limit), fetch="all",
-        ) or []
+    def upsert_member(self, chat_id: int, user: Any, in_chat: bool = True) -> None:
+        """Join or status change: add to the permanent roster.
+
+        last_seen is deliberately not overwritten here, so a quiet member stays
+        quiet in the activity metrics while still receiving @all.
+        """
+        now = time.time()
+        self._query(
+            "INSERT INTO activity "
+            "(chat_id, user_id, name, username, is_bot, last_seen, in_chat, joined_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+            "name=excluded.name, username=excluded.username, is_bot=excluded.is_bot, "
+            "in_chat=excluded.in_chat",
+            (chat_id, user.id, getattr(user, "full_name", "") or "",
+             (getattr(user, "username", "") or "").lower(),
+             int(bool(getattr(user, "is_bot", False))), now,
+             int(in_chat), now if in_chat else 0.0),
+        )
+
+    def mark_member_left(self, chat_id: int, user_id: int) -> None:
+        """Keep the history row, but never mention someone who left or was kicked."""
+        self._query("UPDATE activity SET in_chat=0 WHERE chat_id=? AND user_id=?",
+                    (chat_id, user_id))
+
+    def mention_members(self, chat_id: int, limit: int = 0) -> list[dict]:
+        """Everyone still in the chat, regardless of how long they have been quiet.
+
+        Bots are ALWAYS excluded (is_bot=0) along with deleted/non-user IDs.
+        limit=0 returns the full roster; a positive value caps the broadcast.
+        """
+        sql = ("SELECT user_id, name, username FROM activity "
+               "WHERE chat_id=? AND is_bot=0 AND in_chat=1 AND user_id>0 "
+               "ORDER BY last_seen DESC")
+        params: tuple[Any, ...] = (chat_id,)
+        if limit > 0:
+            sql += " LIMIT ?"
+            params += (limit,)
+        return self._query(sql, params, fetch="all") or []
+
+    def member_stats(self, chat_id: int, dormant_before: float) -> dict:
+        def count(where: str, params: tuple[Any, ...]) -> int:
+            row = self._query(f"SELECT COUNT(*) AS n FROM activity WHERE chat_id=? AND {where}",
+                              (chat_id,) + params, fetch="one")
+            return int(row["n"]) if row else 0
+        return {
+            "humans": count("is_bot=0 AND in_chat=1 AND user_id>0", ()),
+            "bots": count("is_bot=1 AND in_chat=1", ()),
+            "dormant": count("is_bot=0 AND in_chat=1 AND last_seen<?", (dormant_before,)),
+            "left": count("in_chat=0", ()),
+        }
 
     def find_by_username(self, chat_id: int, username: str) -> Optional[dict]:
         return self._query(
@@ -607,14 +716,90 @@ class Database:
         return self._query("SELECT user_id, name, wins FROM wins WHERE chat_id=? "
                            "ORDER BY wins DESC LIMIT ?", (chat_id, limit), fetch="all") or []
 
+    # -- welcome / goodbye templates ---------------------------------------
+    def set_greeting(self, chat_id: int, kind: str, text: str, updated_by: int) -> None:
+        if kind not in ("welcome", "goodbye"):
+            raise ValueError("kind must be 'welcome' or 'goodbye'")
+        column = "welcome" if kind == "welcome" else "goodbye"
+        self._query(
+            f"INSERT INTO greetings (chat_id, {column}, updated_by, updated_at) "
+            f"VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET "
+            f"{column}=excluded.{column}, updated_by=excluded.updated_by, "
+            "updated_at=excluded.updated_at",
+            (chat_id, text, updated_by, time.time()),
+        )
+
+    def get_greetings(self, chat_id: int) -> dict:
+        return self._query("SELECT welcome, goodbye FROM greetings WHERE chat_id=?",
+                           (chat_id,), fetch="one") or {}
+
+    def clear_greeting(self, chat_id: int, kind: str) -> bool:
+        if kind not in ("welcome", "goodbye"):
+            raise ValueError("kind must be 'welcome' or 'goodbye'")
+        column = "welcome" if kind == "welcome" else "goodbye"
+        row = self._query(f"SELECT {column} FROM greetings WHERE chat_id=?",
+                          (chat_id,), fetch="one")
+        existed = bool(row and row.get(column))
+        self._query(f"UPDATE greetings SET {column}=NULL, updated_at=? WHERE chat_id=?",
+                    (time.time(), chat_id))
+        return existed
+
+    # -- private admin console: tokens + connections -----------------------
+    def create_connect_token(self, token: str, chat_id: int, created_by: int) -> None:
+        self._query("DELETE FROM connect_tokens WHERE chat_id=? AND created_by=?",
+                    (chat_id, created_by))
+        self._query("INSERT INTO connect_tokens (token, chat_id, created_by, created_at) "
+                    "VALUES (?, ?, ?, ?)", (token, chat_id, created_by, time.time()))
+
+    def get_connect_token(self, token: str) -> Optional[dict]:
+        return self._query("SELECT * FROM connect_tokens WHERE token=?",
+                           (token,), fetch="one")
+
+    def delete_connect_token(self, token: str) -> None:
+        self._query("DELETE FROM connect_tokens WHERE token=?", (token,))
+
+    def set_connection(self, user_id: int, chat_id: int) -> None:
+        self._query("INSERT OR REPLACE INTO connections (user_id, chat_id, connected_at) "
+                    "VALUES (?, ?, ?)", (user_id, chat_id, time.time()))
+
+    def get_connection(self, user_id: int) -> Optional[dict]:
+        return self._query("SELECT chat_id, connected_at FROM connections WHERE user_id=?",
+                           (user_id,), fetch="one")
+
+    def delete_connection(self, user_id: int) -> None:
+        self._query("DELETE FROM connections WHERE user_id=?", (user_id,))
+
+    # -- permanent-ban ledger ---------------------------------------------
+    def record_ban(self, chat_id: int, user_id: int, name: str,
+                   reason: str, banned_by: int) -> None:
+        self._query(
+            "INSERT INTO bans (chat_id, user_id, display_name, reason, banned_by, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+            "display_name=excluded.display_name, reason=excluded.reason, "
+            "banned_by=excluded.banned_by, created_at=excluded.created_at",
+            (chat_id, user_id, name, reason, banned_by, time.time()),
+        )
+
+    def clear_ban(self, chat_id: int, user_id: int) -> None:
+        self._query("DELETE FROM bans WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+
+    def list_bans(self, chat_id: int, limit: int = 30) -> list[dict]:
+        return self._query("SELECT user_id, display_name, reason, banned_by, created_at "
+                           "FROM bans WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
+                           (chat_id, limit), fetch="all") or []
+
     def dashboard(self, chat_id: int) -> dict:
         def count(table: str) -> int:
             row = self._query(f"SELECT COUNT(*) AS n FROM {table} WHERE chat_id=?",
                               (chat_id,), fetch="one")
             return int(row["n"]) if row else 0
+        row = self._query(
+            "SELECT COUNT(*) AS n FROM activity "
+            "WHERE chat_id=? AND is_bot=0 AND in_chat=1 AND user_id>0",
+            (chat_id,), fetch="one")
         return {"notes": count("notes"), "warned": count("warnings"),
                 "strikes": count("content_strikes"), "trusted": count("link_trust"),
-                "active": count("activity")}
+                "roster": int(row["n"]) if row else 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -622,25 +807,6 @@ class Database:
 # --------------------------------------------------------------------------- #
 
 GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
-
-# Telegram Bot API chat-member status strings. We intentionally compare raw
-# strings instead of PTB constants: ChatMemberStatus.CREATOR was renamed to
-# OWNER in python-telegram-bot 20 and CREATOR no longer exists. Raw values
-# keep this bot working on PTB 20, 21 and 22 alike.
-STATUS_MEMBER = "member"
-STATUS_ADMIN = "administrator"
-STATUS_OWNER = "creator"  # Bot API value behind ChatMemberStatus.OWNER
-STATUS_RESTRICTED = "restricted"
-ADMIN_STATUSES = frozenset({STATUS_ADMIN, STATUS_OWNER})
-MEMBER_STATUSES = frozenset({STATUS_MEMBER, STATUS_ADMIN, STATUS_OWNER})
-
-
-def status_value(status: Any) -> str:
-    """Return the raw Bot API status string for a str/Enum/None value."""
-    value = getattr(status, "value", status)
-    return str(value).lower() if value is not None else ""
-
-
 BACKGROUND_TASKS: set[asyncio.Task] = set()
 _ADMIN_CACHE: dict[tuple[int, int], tuple[bool, float]] = {}
 BROADCAST_LAST: dict[int, float] = {}
@@ -650,7 +816,10 @@ SHADOW_LAST: dict[int, float] = {}
 LINK_RE = re.compile(
     r"(?i)(?:https?://\S+|www\.\S+|(?:t\.me|telegram\.me|tg\.me)/[^\s]+|tg://\S+)"
 )
-BROADCAST_RE = re.compile(r"^@(all|admin)\b(?:\s+([\s\S]+))?$", re.IGNORECASE)
+BROADCAST_RE = re.compile(
+    r"^(?:@(all|admin)\b|/mention(all|admin)(?:@\w+)?\b)(?:\s+([\s\S]+))?$",
+    re.IGNORECASE,
+)
 CAPTCHA_RE = re.compile(r"^cv:(-?\d+):(\d+):([A-Za-z0-9_\-]+)$")
 DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$", re.IGNORECASE)
 NOTE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
@@ -739,9 +908,7 @@ async def is_admin(bot, chat_id: int, user_id: int, ttl: float = 45.0) -> bool:
         return cached[0]
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        # Version-proof: 'administrator' or 'creator' (PTB 20+ exposes the
-        # owner status as ChatMemberStatus.OWNER, not the old CREATOR).
-        allowed = status_value(getattr(member, "status", "")) in ADMIN_STATUSES
+        allowed = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR)
     except TelegramError as exc:
         logger.debug("Admin lookup failed for %s in %s: %s", user_id, chat_id, exc)
         return False
@@ -779,6 +946,257 @@ async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return True
     await message.reply_text(f"🔒 Only admins can {action}.")
     return False
+
+
+RIGHT_LABELS = {
+    "can_restrict_members": "Ban / restrict members",
+    "can_change_info": "Change group info",
+    "can_delete_messages": "Delete messages",
+}
+
+
+async def has_right(bot, chat_id: int, user_id: int, right: str,
+                    cfg: Optional[Config] = None) -> bool:
+    """Check a specific Telegram admin right (creator and bot owners always pass)."""
+    if cfg and user_id in cfg.owner_ids:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+    except TelegramError as exc:
+        logger.debug("Right lookup failed for %s/%s: %s", chat_id, user_id, exc)
+        return False
+    if member.status == ChatMemberStatus.CREATOR:
+        return True
+    if member.status != ChatMemberStatus.ADMINISTRATOR:
+        return False
+    return bool(getattr(member, right, False))
+
+
+async def require_right(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        right: str, action: str) -> bool:
+    """Group-only gate for destructive commands such as /ban, /kick and /mute."""
+    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or not user or not message:
+        return False
+    if chat.type not in GROUP_TYPES:
+        await message.reply_text(
+            "Run this command in the group, replying to the member. "
+            "The private console is reserved for greeting settings and ban records.")
+        return False
+    cfg, _ = state(context)
+    if await has_right(bot_of(context), chat.id, user.id, right, cfg):
+        return True
+    label = RIGHT_LABELS.get(right, right)
+    await message.reply_text(
+        f"🔒 You need the <b>{esc(label)}</b> admin right to {esc(action)}.",
+        parse_mode=ParseMode.HTML)
+    return False
+
+
+def user_first_name(user: Any) -> str:
+    first = (getattr(user, "first_name", None) or "").strip()
+    if first:
+        return first
+    full = (getattr(user, "full_name", None) or "").strip()
+    return full.split()[0] if full else "there"
+
+
+class _SafeTemplate(dict):
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
+
+
+def render_greeting(template: str, user: Any, chat_title: str,
+                    member_count: Optional[int] = None) -> str:
+    """Fill greeting placeholders; member values are HTML-escaped."""
+    first = user_first_name(user)
+    full = getattr(user, "full_name", None) or first
+    username = getattr(user, "username", None)
+    values = _SafeTemplate(
+        first=esc(first),
+        user=esc(full),
+        username=esc("@" + username) if username else esc(first),
+        mention=mention(getattr(user, "id", 0), first),
+        group=esc(chat_title or "the group"),
+        id=str(getattr(user, "id", "")),
+        count=str(member_count) if member_count is not None else "",
+    )
+    try:
+        return template.format_map(values)
+    except (ValueError, IndexError):
+        return template
+
+
+async def chat_title(bot, chat_id: int) -> str:
+    try:
+        chat = await bot.get_chat(chat_id)
+        return getattr(chat, "title", None) or "this group"
+    except TelegramError:
+        return "this group"
+
+
+async def send_greeting(bot, chat_id: int, template: str, user: Any,
+                        title: str, count: Optional[int] = None) -> None:
+    """Send a rendered welcome/goodbye; fall back to plain text on bad HTML."""
+    text = render_greeting(template, user, title, count)
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML,
+                               disable_web_page_preview=True)
+    except BadRequest as exc:
+        logger.warning("Greeting HTML rejected (%s); resending as plain text", exc)
+        plain = html.unescape(re.sub(r"<[^>]+>", "", text))
+        try:
+            await bot.send_message(chat_id=chat_id, text=plain,
+                                   disable_web_page_preview=True)
+        except TelegramError as plain_exc:
+            logger.warning("Could not send greeting in %s: %s", chat_id, plain_exc)
+    except TelegramError as exc:
+        logger.warning("Could not send greeting in %s: %s", chat_id, exc)
+
+
+def _card_font(size: int, bold: bool = False):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf" if bold
+        else "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size)
+        except (OSError, TypeError):
+            continue
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
+
+
+def build_welcome_card(first: str, title: str, username: str = "") -> Optional[BytesIO]:
+    """Draw a lightweight welcome photo. CPU work runs via asyncio.to_thread."""
+    if not (WELCOME_CARD_ENABLED and OCR_AVAILABLE and Image and ImageDraw):
+        return None
+    try:
+        width, height = 1200, 600
+        image = Image.new("RGB", (width, height), (8, 13, 22))
+        draw = ImageDraw.Draw(image)
+        for y in range(height):  # deep teal-to-indigo gradient
+            ratio = y / height
+            colour = (int(8 + 10 * ratio), int(20 + 28 * ratio), int(34 + 52 * ratio))
+            draw.line([(0, y), (width, y)], fill=colour)
+        draw.rounded_rectangle((58, 58, width - 58, height - 58), radius=36,
+                               outline=(62, 224, 189), width=3)
+        draw.ellipse((108, 170, 348, 410), fill=(62, 224, 189))
+        initial = (first or "?").strip()[:1].upper() or "?"
+        initial_font = _card_font(140, bold=True)
+        draw.text((228, 290), initial, font=initial_font, fill=(4, 18, 24), anchor="mm")
+        draw.text((108, 112), "MISS SONA  ·  COMMUNITY", font=_card_font(24, bold=True),
+                  fill=(110, 168, 254))
+        draw.text((408, 205), "WELCOME", font=_card_font(30, bold=True), fill=(62, 224, 189))
+        name = " ".join((first or "there").split())[:28]
+        draw.text((404, 250), name, font=_card_font(86, bold=True), fill=(240, 248, 255))
+        group_line = " ".join((title or "our group").split())
+        group_line = group_line[:42] + ("…" if len(group_line) > 42 else "")
+        draw.text((408, 365), f"to {group_line}", font=_card_font(40), fill=(190, 208, 230))
+        handle = f"@{username}" if username else ""
+        draw.text((108, 462), handle, font=_card_font(30), fill=(141, 156, 181))
+        draw.text((width - 108, 474), "You're verified ✓", font=_card_font(26, bold=True),
+                  fill=(62, 224, 189), anchor="ra")
+        buffer = BytesIO()
+        image.save(buffer, format="PNG", optimize=True)
+        buffer.seek(0)
+        return buffer
+    except Exception as exc:  # A failed card must never block the welcome.
+        logger.debug("Welcome card generation failed: %s", exc)
+        return None
+
+
+async def send_welcome(bot, chat_id: int, template: str, user: Any,
+                       title: str, count: Optional[int] = None) -> None:
+    """Welcome after captcha: rendered card photo + configured message."""
+    text = render_greeting(template, user, title, count)
+    card = await asyncio.to_thread(build_welcome_card, user_first_name(user), title,
+                                  getattr(user, "username", "") or "")
+    if card is not None:
+        caption = text if len(text) <= 950 else None
+        try:
+            await bot.send_photo(
+                chat_id=chat_id, photo=card,
+                caption=caption or f"👋 Welcome to {esc(title)}!",
+                parse_mode=ParseMode.HTML)
+            if caption is None:
+                await send_greeting(bot, chat_id, template, user, title, count)
+            return
+        except TelegramError as exc:
+            logger.warning("Welcome photo failed in %s; sending text: %s", chat_id, exc)
+    await send_greeting(bot, chat_id, template, user, title, count)
+
+
+async def member_count(bot, chat_id: int) -> Optional[int]:
+    try:
+        return await bot.get_chat_member_count(chat_id)
+    except TelegramError:
+        return None
+
+
+async def greeting_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          *, manage: bool) -> Optional[tuple[int, str]]:
+    """Resolve the group whose greeting is viewed/edited, from group or /connect PM."""
+    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or not user or not message:
+        return None
+    bot, (cfg, db) = bot_of(context), state(context)
+    if chat.type in GROUP_TYPES:
+        if manage and not await has_right(bot, chat.id, user.id, "can_change_info", cfg):
+            await message.reply_text(
+                "🔒 Only the group owner or admins with the <b>Change group info</b> "
+                "right can change greetings.", parse_mode=ParseMode.HTML)
+            return None
+        return chat.id, getattr(chat, "title", None) or "this group"
+    if chat.type == ChatType.PRIVATE:
+        conn = await db.run(db.get_connection, user.id)
+        if not conn:
+            await message.reply_text(
+                "🔗 No group connected. In your group, send <code>/connect</code> "
+                "as the owner or an admin with the <b>Change group info</b> right, "
+                "then open the private link.", parse_mode=ParseMode.HTML)
+            return None
+        target_id = int(conn["chat_id"])
+        if not await has_right(bot, target_id, user.id, "can_change_info", cfg):
+            await message.reply_text(
+                "🔒 You no longer have the <b>Change group info</b> right in the "
+                "connected group. Ask the owner or reconnect after being promoted.",
+                parse_mode=ParseMode.HTML)
+            return None
+        return target_id, await chat_title(bot, target_id)
+    await message.reply_text("Greeting settings work in groups and in private chat.")
+    return None
+
+
+async def private_management_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                                    right: str) -> Optional[tuple[int, str]]:
+    """Resolve a connected group for a PM admin, enforcing a specific right."""
+    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
+    if not chat or not user or not message or chat.type != ChatType.PRIVATE:
+        return None
+    bot, (cfg, db) = bot_of(context), state(context)
+    conn = await db.run(db.get_connection, user.id)
+    if not conn:
+        await message.reply_text(
+            "🔗 Connect a group first: send <code>/connect</code> in the group as its "
+            "owner or an admin with the Change group info right.", parse_mode=ParseMode.HTML)
+        return None
+    target_id = int(conn["chat_id"])
+    if not await has_right(bot, target_id, user.id, right, cfg):
+        label = RIGHT_LABELS.get(right, right)
+        await message.reply_text(
+            f"🔒 You need the <b>{esc(label)}</b> right in the connected group.",
+            parse_mode=ParseMode.HTML)
+        return None
+    return target_id, await chat_title(bot, target_id)
 
 
 async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[Optional[int], str]:
@@ -866,9 +1284,10 @@ def parse_duration(token: str) -> Optional[timedelta]:
 # --------------------------------------------------------------------------- #
 
 async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "ban members"):
+    """Permanent ban; only admins with the Ban/Restrict members right may use it."""
+    if not await require_right(update, context, "can_restrict_members", "ban members"):
         return
-    message, chat = update.effective_message, update.effective_chat
+    message, chat, actor = update.effective_message, update.effective_chat, update.effective_user
     target_id, name = await resolve_target(update, context)
     if target_id is None or not await target_guard(update, context, target_id):
         await message.reply_text("Usage: reply to a user with <code>/ban [reason]</code> "
@@ -887,30 +1306,84 @@ async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await db.run(db.reset_warns, chat.id, target_id)
     await db.run(db.finish_captcha, chat.id, target_id)
-    await message.reply_text(f"🔨 {mention(target_id, name)} banned.\n<i>Reason:</i> {esc(reason)}",
-                             parse_mode=ParseMode.HTML)
-    logger.info("ban chat=%s target=%s by=%s", chat.id, target_id, update.effective_user.id)
+    await db.run(db.mark_member_left, chat.id, target_id)
+    await db.run(db.record_ban, chat.id, target_id, name, reason, actor.id)
+    await message.reply_text(f"🔨 {mention(target_id, name)} banned.\n<i>Reason:</i> {esc(reason)}\n"
+                             "<i>Recorded in /banned.</i>", parse_mode=ParseMode.HTML)
+    logger.info("ban chat=%s target=%s by=%s", chat.id, target_id, actor.id)
 
 
 async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "unban members"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: <code>/unban 123456789</code> (a numeric ID is required).",
-                                 parse_mode=ParseMode.HTML)
-        return
+    """Unban works in the group, or in PM through a /connect-ed group."""
+    message, effective_chat, actor = (update.effective_message, update.effective_chat,
+                                      update.effective_user)
+    bot, (cfg, db) = bot_of(context), state(context)
+    if effective_chat.type == ChatType.PRIVATE:
+        target = await private_management_target(update, context, "can_restrict_members")
+        if not target:
+            return
+        chat_id, title = target
+        args = [a for a in (context.args or []) if a.lstrip("-").isdigit()]
+        target_id = int(args[0]) if args else None
+        name = str(target_id) if target_id else "member"
+        if target_id is None:
+            await message.reply_text(
+                "Usage in private: <code>/unban 123456789</code>.\n"
+                "Use /banned to see IDs recorded for the connected group.",
+                parse_mode=ParseMode.HTML)
+            return
+    else:
+        if not await require_right(update, context, "can_restrict_members", "unban members"):
+            return
+        chat_id, title = effective_chat.id, await chat_title(bot, effective_chat.id)
+        target_id, name = await resolve_target(update, context)
+        if target_id is None:
+            await message.reply_text(
+                "Usage: reply to a banned user's message with <code>/unban</code>, or "
+                "<code>/unban 123456789</code>. Use /banned to see recorded bans.",
+                parse_mode=ParseMode.HTML)
+            return
     try:
-        await bot_of(context).unban_chat_member(chat.id, target_id, only_if_banned=True)
+        await bot.unban_chat_member(chat_id, target_id, only_if_banned=True)
     except TelegramError as exc:
         await message.reply_text(f"Could not unban: {esc(exc)}", parse_mode=ParseMode.HTML)
         return
-    await message.reply_text(f"✅ {mention(target_id, name)} may join again.", parse_mode=ParseMode.HTML)
+    await db.run(db.clear_ban, chat_id, target_id)
+    await message.reply_text(
+        f"✅ {mention(target_id, name)} may join <b>{esc(title)}</b> again.",
+        parse_mode=ParseMode.HTML)
+    logger.info("unban chat=%s target=%s by=%s", chat_id, target_id, actor.id)
+
+
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Kick (ban + immediate unban) without leaving the user in /banned."""
+    if not await require_right(update, context, "can_restrict_members", "kick members"):
+        return
+    message, chat, actor = update.effective_message, update.effective_chat, update.effective_user
+    target_id, name = await resolve_target(update, context)
+    if target_id is None or not await target_guard(update, context, target_id):
+        await message.reply_text("Usage: reply to a user with <code>/kick [reason]</code>.",
+                                 parse_mode=ParseMode.HTML)
+        return
+    reason = reason_from_args(update, context) or "no reason provided"
+    bot, (_, db) = bot_of(context), state(context)
+    SUPPRESS_GOODBYE.add((chat.id, target_id))
+    try:
+        await bot.ban_chat_member(chat.id, target_id)
+        await bot.unban_chat_member(chat.id, target_id, only_if_banned=True)
+    except TelegramError as exc:
+        await message.reply_text(f"Could not kick: {esc(exc)}", parse_mode=ParseMode.HTML)
+        return
+    await db.run(db.finish_captcha, chat.id, target_id)
+    await db.run(db.mark_member_left, chat.id, target_id)
+    await message.reply_text(
+        f"👢 {mention(target_id, name)} kicked (not a permanent ban).\n"
+        f"<i>Reason:</i> {esc(reason)}", parse_mode=ParseMode.HTML)
+    logger.info("kick chat=%s target=%s by=%s", chat.id, target_id, actor.id)
 
 
 async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "restrict members"):
+    if not await require_right(update, context, "can_restrict_members", "mute members"):
         return
     message, chat = update.effective_message, update.effective_chat
     target_id, name = await resolve_target(update, context)
@@ -941,7 +1414,7 @@ async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "restore members"):
+    if not await require_right(update, context, "can_restrict_members", "unmute members"):
         return
     message, chat = update.effective_message, update.effective_chat
     target_id, name = await resolve_target(update, context)
@@ -961,7 +1434,7 @@ async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "warn members"):
+    if not await require_right(update, context, "can_restrict_members", "warn members"):
         return
     message, chat = update.effective_message, update.effective_chat
     target_id, name = await resolve_target(update, context)
@@ -977,6 +1450,10 @@ async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             await bot_of(context).ban_chat_member(chat.id, target_id)
             await db.run(db.reset_warns, chat.id, target_id)
+            await db.run(db.mark_member_left, chat.id, target_id)
+            await db.run(db.record_ban, chat.id, target_id, name,
+                         f"warning limit ({cfg.warn_limit}): {reason}",
+                         update.effective_user.id)
             await message.reply_text(
                 f"⛔ {who} reached <b>{count}/{cfg.warn_limit}</b> warnings and was banned.\n"
                 f"<i>Last reason:</i> {esc(reason)}", parse_mode=ParseMode.HTML)
@@ -1181,6 +1658,10 @@ async def enforce_content_policy(update: Update, context: ContextTypes.DEFAULT_T
         try:
             await bot.ban_chat_member(chat.id, user.id)
             await db.run(db.reset_content_strikes, chat.id, user.id)
+            await db.run(db.mark_member_left, chat.id, user.id)
+            await db.run(db.record_ban, chat.id, user.id, user.full_name or str(user.id),
+                         f"prohibited {detail} ({strikes}/{cfg.content_ban_threshold} strikes)",
+                         getattr(bot, "id", 0))
             tail = (f"⛔ {mention(user.id, user.full_name)} was <b>banned</b> as a repeat "
                     f"offender ({strikes}/{cfg.content_ban_threshold} strikes).")
         except TelegramError as exc:
@@ -1274,6 +1755,25 @@ def chunks(items: list[Any], size: int) -> Iterable[list[Any]]:
         yield items[index:index + max(1, size)]
 
 
+async def sync_admin_roster(bot, db: Database, chat_id: int) -> int:
+    """Capture administrators, who may never have posted, into the roster.
+
+    The Bot API cannot enumerate ordinary silent members; this at least makes
+    sure every current human admin is known and mentionable.
+    """
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+    except TelegramError as exc:
+        logger.warning("Could not sync admins in %s: %s", chat_id, exc)
+        return 0
+    synced = 0
+    for member in admins:
+        if member.user and not member.user.is_bot:
+            await db.run(db.upsert_member, chat_id, member.user, True)
+            synced += 1
+    return synced
+
+
 async def send_mention_batch(bot, chat_id: int, members: list[dict]) -> None:
     """One HTML message containing one or more clickable user mentions."""
     text = " ".join(
@@ -1294,13 +1794,13 @@ async def send_mention_batch(bot, chat_id: int, members: list[dict]) -> None:
 
 
 async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """@all [message] / @admin [message] - admin only, paced by asyncio.sleep(3)."""
+    """@all/@admin (or /mentionall, /mentionadmin) - paced by asyncio.sleep(3)."""
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
     match = BROADCAST_RE.match(message.text or "")
     if not match:
         raise ApplicationHandlerStop
-    mode = match.group(1).lower()
-    note = (match.group(2) or "").strip()
+    mode = (match.group(1) or match.group(2)).lower()
+    note = (match.group(3) or "").strip()
     cfg, db = state(context)
     bot = bot_of(context)
     application = context.application
@@ -1334,28 +1834,42 @@ async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await temp_reply(bot, chat.id, f"Could not read admin list: {esc(exc)}",
                                  delay=8, application=application)
                 raise ApplicationHandlerStop
-            targets = [
-                {"user_id": a.user.id, "name": a.user.full_name, "username": a.user.username or ""}
-                for a in admins if a.user and not a.user.is_bot
-            ]
-            label = "administrators"
+            targets = []
+            for admin in admins:
+                if not admin.user or admin.user.is_bot:
+                    continue  # Never mention bot accounts.
+                await db.run(db.upsert_member, chat.id, admin.user, True)
+                targets.append({"user_id": admin.user.id, "name": admin.user.full_name,
+                                "username": admin.user.username or ""})
+            label = "human administrators (bots excluded)"
         else:
-            since = time.time() - cfg.active_window_days * 86400
-            targets = await db.run(db.active_members, chat.id, since, cfg.max_mentions)
-            label = f"active members (last {cfg.active_window_days} days)"
+            # Capture current admins first, then mention EVERY known human member.
+            # There is no last_seen filter: dormant members are included, and
+            # bots are excluded by mention_members().
+            await sync_admin_roster(bot, db, chat.id)
+            targets = await db.run(db.mention_members, chat.id, cfg.max_mentions)
+            label = "known members — active or dormant · bots excluded"
 
         if not targets:
             await temp_reply(bot, chat.id,
-                             "No eligible members found yet. The activity table fills as people chat.",
-                             delay=10, application=application)
+                             "No human members are on the mention roster yet. I learn members "
+                             "from joins, messages and the admin list; run /syncmembers after "
+                             "adding admins, and new joiners are captured automatically.",
+                             delay=12, application=application)
             raise ApplicationHandlerStop
 
+        batches = list(chunks(targets, cfg.mention_batch_size))
+        pauses = max(0, len(batches) - 1)
+        eta_seconds = int(pauses * cfg.mention_delay)
+        eta = (f"{eta_seconds // 60}m {eta_seconds % 60}s" if eta_seconds >= 60
+               else f"{eta_seconds}s")
+        cap_note = " · MAX_MENTIONS cap applied" if cfg.max_mentions else ""
         header = (f"📢 <b>Announcement from {mention(user.id, user.full_name)}</b>\n"
                   f"{esc(note) if note else '(no message attached)'}\n"
-                  f"<i>Tagging {len(targets)} {label} — paced at {cfg.mention_delay:g}s.</i>")
+                  f"<i>Mentioning {len(targets)} {label}{cap_note} — "
+                  f"{cfg.mention_delay:g}s apart, ~{eta} total.</i>")
         await bot.send_message(chat_id=chat.id, text=header, parse_mode=ParseMode.HTML)
 
-        batches = list(chunks(targets, cfg.mention_batch_size))
         for index, batch in enumerate(batches):
             await send_mention_batch(bot, chat.id, batch)
             if index < len(batches) - 1:
@@ -1371,11 +1885,11 @@ async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # --------------------------------------------------------------------------- #
 
 def memberish(member: Any) -> bool:
-    """True for statuses that count as being in the chat (version-proof)."""
-    status = status_value(getattr(member, "status", ""))
-    if status in MEMBER_STATUSES:
+    status = member.status
+    if status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                  ChatMemberStatus.CREATOR):
         return True
-    return status == STATUS_RESTRICTED and bool(getattr(member, "is_member", False))
+    return status == ChatMemberStatus.RESTRICTED and bool(getattr(member, "is_member", False))
 
 
 async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1390,9 +1904,11 @@ async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
     row = await db.run(db.get_captcha, chat_id, user_id)
     if not row or row["token"] != token:
         return  # Already verified, re-joined, or manually handled.
+    SUPPRESS_GOODBYE.add((chat_id, user_id))  # Never send goodbye for timeouts.
     try:
         await kick_user(bot, chat_id, user_id)
         await db.run(db.finish_captcha, chat_id, user_id)
+        await db.run(db.mark_member_left, chat_id, user_id)
         await safe_delete(bot, chat_id, int(row["message_id"]))
         await temp_reply(bot, chat_id,
                          f"⏳ {mention(user_id, row['display_name'])} was removed: "
@@ -1429,18 +1945,38 @@ def schedule_captcha_timeout(application: Application, chat_id: int, user_id: in
 
 
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Restrict new joiners and send the inline verification button."""
+    """Keep the roster in sync, restrict new joiners and send the captcha."""
     change = update.chat_member
     if not change or not change.new_chat_member:
         return
     old, new = change.old_chat_member, change.new_chat_member
-    if memberish(old) or not memberish(new):
-        return
     user, chat = new.user, change.chat
-    if user.is_bot or user.id in state(context)[0].owner_ids:
+    if not user or user.is_bot:
+        return  # Bots never enter the mention roster.
+    cfg, db = state(context)
+    was_member, is_member = memberish(old), memberish(new)
+    if is_member:
+        await db.run(db.upsert_member, chat.id, user, True)
+    elif was_member:
+        await db.run(db.mark_member_left, chat.id, user.id)
+        await db.run(db.finish_captcha, chat.id, user.id)
+        key = (chat.id, user.id)
+        bot = bot_of(context)
+        if key in SUPPRESS_GOODBYE:
+            SUPPRESS_GOODBYE.discard(key)  # Bot-initiated kick: no goodbye.
+        elif new.status == ChatMemberStatus.LEFT and user.id not in cfg.owner_ids:
+            greetings = await db.run(db.get_greetings, chat.id)
+            template = (greetings or {}).get("goodbye") or DEFAULT_GOODBYE_TEXT
+            await send_greeting(bot, chat.id, template, user,
+                                getattr(chat, "title", None) or "the group",
+                                await member_count(bot, chat.id))
+        logger.info("member left chat=%s user=%s", chat.id, user.id)
+        return
+    if was_member or not is_member:
+        return  # Role change only; roster already updated above.
+    if user.id in cfg.owner_ids:
         return
     bot = bot_of(context)
-    cfg, db = state(context)
     try:
         await bot.restrict_chat_member(chat_id=chat.id, user_id=user.id,
                                        permissions=ChatPermissions.no_permissions())
@@ -1455,14 +1991,15 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         InlineKeyboardButton("✅ Click here to prove you're human",
                              callback_data=f"cv:{chat.id}:{user.id}:{token}")
     ]])
-    welcome_text = (
-        f"👋 Welcome, {mention(user.id, user.full_name)}!\n\n"
-        "To keep this group spam-free, please confirm you're human by pressing "
-        f"the button below within <b>{cfg.captcha_timeout // 60} minute(s)</b>. "
-        "You can't post messages until you do."
+    captcha_text = (
+        f"🔐 {mention(user.id, user.full_name)}, verification required.\n\n"
+        "To keep this group spam-free, prove you're human by pressing the button "
+        f"below within <b>{cfg.captcha_timeout // 60} minute(s)</b>. "
+        "Your welcome message arrives right after verification. "
+        "You can't post until you verify."
     )
     try:
-        sent = await bot.send_message(chat_id=chat.id, text=welcome_text,
+        sent = await bot.send_message(chat_id=chat.id, text=captcha_text,
                                       parse_mode=ParseMode.HTML, reply_markup=keyboard)
     except TelegramError as exc:
         logger.warning("Could not send captcha message: %s", exc)
@@ -1501,16 +2038,22 @@ async def on_captcha_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if context.application.job_queue:
         for job in context.application.job_queue.get_jobs_by_name(f"captcha:{chat_id}:{target_id}"):
             job.schedule_removal()
-    await query.answer("✅ Verified — welcome to the group!")
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=int(row["message_id"]),
-            text=f"✅ {mention(target_id, query.from_user.full_name)} is verified. Welcome!",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
-        pass
-    logger.info("captcha verified chat=%s user=%s", chat_id, target_id)
+    await query.answer("✅ Verified — here comes your welcome!")
+    # Remove the verification prompt, then deliver the configured welcome.
+    prompt_deleted = await safe_delete(bot, chat_id, int(row["message_id"]))
+    if not prompt_deleted:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=int(row["message_id"]),
+                text="✅ Verification complete.", reply_markup=None)
+        except TelegramError:
+            pass
+    greetings = await db.run(db.get_greetings, chat_id)
+    template = (greetings or {}).get("welcome") or DEFAULT_WELCOME_TEXT
+    title = await chat_title(bot, chat_id)
+    await send_welcome(bot, chat_id, template, query.from_user, title,
+                       await member_count(bot, chat_id))
+    logger.info("captcha verified + welcomed chat=%s user=%s", chat_id, target_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1679,21 +2222,327 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                                               parse_mode=ParseMode.HTML)
 
 
+async def cmd_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the @all audience: every known human, regardless of activity."""
+    _, db = state(context)
+    dormant_cutoff = time.time() - 30 * 86400
+    stats = await db.run(db.member_stats, update.effective_chat.id, dormant_cutoff)
+    await update.effective_message.reply_text(
+        "👥 <b>Mention roster</b>\n"
+        f"Humans mentionable by @all: <b>{stats['humans']}</b>\n"
+        f"Quiet for 30+ days (still included): <b>{stats['dormant']}</b>\n"
+        f"Bots excluded: <b>{stats['bots']}</b>\n"
+        f"Left/kicked (skipped): <b>{stats['left']}</b>\n\n"
+        "<i>@all reaches every human above whether active or inactive. Joins, message "
+        "authors and admins are stored automatically; use /syncmembers after promoting "
+        "an admin. Telegram's Bot API cannot enumerate silent members I have never seen.</i>",
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_syncmembers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin: add the current administrator list to the permanent roster."""
+    if not await require_admin(update, context, "sync the member roster"):
+        return
+    bot, chat, db = bot_of(context), update.effective_chat, state(context)[1]
+    synced = await sync_admin_roster(bot, db, chat.id)
+    stats = await db.run(db.member_stats, chat.id, time.time() - 30 * 86400)
+    await update.effective_message.reply_text(
+        f"👥 Roster synced. Captured <b>{synced}</b> human administrator(s).\n"
+        f"Mentionable humans: <b>{stats['humans']}</b> · bots excluded: <b>{stats['bots']}</b> "
+        f"· left/kicked skipped: <b>{stats['left']}</b>.\n\n"
+        "<i>Note: the Bot API has no method to list ordinary group members. The roster is "
+        "built permanently from joins, message authors and admins. Previously silent members "
+        "who joined before I was added cannot be discovered until they speak.</i>",
+        parse_mode=ParseMode.HTML)
+
+
+# --------------------------------------------------------------------------- #
+# 7. Welcome / goodbye greetings + private /connect console                    #
+# --------------------------------------------------------------------------- #
+
+async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Group: issue a private deep link. PM: show status or consume a token."""
+    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
+    bot, (cfg, db) = bot_of(context), state(context)
+    if chat.type == ChatType.PRIVATE:
+        if context.args:
+            await complete_connection(update, context, context.args[0])
+            return
+        conn = await db.run(db.get_connection, user.id)
+        if conn:
+            title = await chat_title(bot, int(conn["chat_id"]))
+            await message.reply_text(
+                f"✅ Connected to <b>{esc(title)}</b>.\n\n"
+                "<b>Private group console</b>\n"
+                "/welcome — view the welcome message\n"
+                "/setwelcome — change it (Change group info right)\n"
+                "/rmwelcome — restore the default\n"
+                "/goodbye · /setgoodbye · /rmgoodbye\n"
+                "/banned — recorded bans\n"
+                "/unban &lt;id&gt; — lift a recorded ban (Ban right)\n"
+                "/disconnect — unlink this group",
+                parse_mode=ParseMode.HTML)
+        else:
+            await message.reply_text(
+                "🔗 <b>Connect a group</b>\n"
+                "In your group, send <code>/connect</code>. The owner or an admin with "
+                "the <b>Change group info</b> right receives a private link to this chat. "
+                "Open it, then manage greetings and bans here.",
+                parse_mode=ParseMode.HTML)
+        return
+    if chat.type not in GROUP_TYPES:
+        await message.reply_text("Use /connect inside a group.")
+        return
+    if not await has_right(bot, chat.id, user.id, "can_change_info", cfg):
+        await message.reply_text(
+            "🔒 Only the group owner or an admin with the <b>Change group info</b> "
+            "right can connect this group.", parse_mode=ParseMode.HTML)
+        return
+    token = secrets.token_urlsafe(18)
+    await db.run(db.create_connect_token, token, chat.id, user.id)
+    try:
+        username = context.application.bot.username or (await bot.get_me()).username
+    except TelegramError:
+        username = getattr(bot, "username", None)
+    if not username:
+        await message.reply_text("Could not resolve my username; please retry.")
+        return
+    deep_link = f"https://t.me/{username}?start=connect_{token}"
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔗 Open private admin console", url=deep_link)]])
+    title = getattr(chat, "title", None) or "your group"
+    dm_text = (
+        f"🔗 <b>Connect {esc(title)}</b>\n"
+        "You are eligible because you are the owner or have the Change group info right.\n"
+        "Press the button, or send <code>/connect " + token + "</code> here. "
+        f"The link expires in {CONNECT_TOKEN_TTL // 60} minutes and works once.")
+    try:
+        await bot.send_message(chat_id=user.id, text=dm_text, parse_mode=ParseMode.HTML,
+                               reply_markup=keyboard)
+        sent = True
+    except TelegramError as exc:
+        sent = False
+        logger.info("Could not DM connect link to %s: %s", user.id, exc)
+    await message.reply_text(
+        ("📬 I sent the private connection link to your DM." if sent else
+         "📬 Open the private connection link below (start me in DM first if needed).") +
+        "\nIt is valid for 15 minutes and can be used once.",
+        parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def complete_connection(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                              raw_token: str) -> None:
+    """Consume a single-use connect token in private and remember the group."""
+    user, message = update.effective_user, update.effective_message
+    bot, (cfg, db) = bot_of(context), state(context)
+    token = raw_token.removeprefix("connect_").strip()
+    row = await db.run(db.get_connect_token, token)
+    if not row:
+        await message.reply_text("❌ This connection link is invalid, used, or expired. "
+                                 "Send /connect in the group again.")
+        return
+    if int(row["created_by"]) != user.id and user.id not in cfg.owner_ids:
+        await message.reply_text("❌ This link was issued to another administrator.")
+        return
+    if time.time() - float(row["created_at"]) > CONNECT_TOKEN_TTL:
+        await db.run(db.delete_connect_token, token)
+        await message.reply_text("❌ This link expired. Send /connect in the group again.")
+        return
+    chat_id = int(row["chat_id"])
+    if not await has_right(bot, chat_id, user.id, "can_change_info", cfg):
+        await message.reply_text(
+            "🔒 The Change group info right is required. Ask the owner to promote you, "
+            "then send /connect in the group again.")
+        return
+    await db.run(db.set_connection, user.id, chat_id)
+    await db.run(db.delete_connect_token, token)
+    title = await chat_title(bot, chat_id)
+    await message.reply_text(
+        f"✅ Connected to <b>{esc(title)}</b>.\n"
+        "Manage it from here with /welcome, /setwelcome, /rmwelcome, /goodbye, "
+        "/setgoodbye, /rmgoodbye, /banned and /unban. Use /disconnect to unlink.",
+        parse_mode=ParseMode.HTML)
+    logger.info("private console connected user=%s chat=%s", user.id, chat_id)
+
+
+async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("Use /disconnect in a private chat.")
+        return
+    _, db = state(context)
+    await db.run(db.delete_connection, update.effective_user.id)
+    await update.effective_message.reply_text(
+        "🔌 Disconnected. Your group settings are unchanged.")
+
+
+async def _show_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         kind: str) -> None:
+    target = await greeting_target(update, context, manage=False)
+    if not target:
+        return
+    chat_id, title = target
+    _, db = state(context)
+    bot = bot_of(context)
+    row = await db.run(db.get_greetings, chat_id)
+    custom = (row or {}).get(kind) or ""
+    default = DEFAULT_WELCOME_TEXT if kind == "welcome" else DEFAULT_GOODBYE_TEXT
+    template = custom or default
+    count = await member_count(bot, chat_id)
+    rendered = render_greeting(template, update.effective_user, title, count)
+    icon = "👋"
+    label = "Welcome" if kind == "welcome" else "Goodbye"
+    await update.effective_message.reply_text(
+        f"{icon} <b>{label} message</b> — {esc(title)}\n"
+        f"Source: <b>{'custom' if custom else 'default'}</b>\n\n"
+        f"<b>Template</b>\n<code>{esc(template)}</code>\n\n"
+        f"<b>Rendered for you</b>\n<code>{esc(rendered)}</code>\n\n"
+        f"<i>Placeholders:</i>\n{esc(GREETING_PLACEHOLDERS)}\n\n"
+        f"Set: /set{kind} · Remove: /rm{kind}",
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show_greeting(update, context, "welcome")
+
+
+async def cmd_goodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _show_greeting(update, context, "goodbye")
+
+
+async def _set_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        kind: str) -> None:
+    target = await greeting_target(update, context, manage=True)
+    if not target:
+        return
+    chat_id, title = target
+    message = update.effective_message
+    text = command_payload(message)
+    if not text:
+        await message.reply_text(
+            f"Usage: <code>/set{kind} your message</code>\n\n"
+            f"Example: <code>Hey {{first}}, welcome to {{group}}! 🎉</code>\n\n"
+            f"<b>Placeholders</b>\n{esc(GREETING_PLACEHOLDERS)}",
+            parse_mode=ParseMode.HTML)
+        return
+    if len(text) > GREETING_LIMIT:
+        await message.reply_text(f"The message is limited to {GREETING_LIMIT} characters.")
+        return
+    _, db = state(context)
+    await db.run(db.set_greeting, chat_id, kind, text, update.effective_user.id)
+    rendered = render_greeting(text, update.effective_user, title,
+                               await member_count(bot_of(context), chat_id))
+    await message.reply_text(
+        f"✅ Custom {kind} message saved for <b>{esc(title)}</b>.\n"
+        f"<code>{esc(text)}</code>\n\n"
+        f"<b>Preview</b>\n<code>{esc(rendered)}</code>\n\n"
+        f"Use /{kind} to review or /rm{kind} to reset.",
+        parse_mode=ParseMode.HTML)
+    logger.info("%s template updated chat=%s by=%s",
+                kind, chat_id, update.effective_user.id)
+
+
+async def cmd_setwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_greeting(update, context, "welcome")
+
+
+async def cmd_setgoodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _set_greeting(update, context, "goodbye")
+
+
+async def _remove_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                           kind: str) -> None:
+    target = await greeting_target(update, context, manage=True)
+    if not target:
+        return
+    chat_id, title = target
+    _, db = state(context)
+    removed = await db.run(db.clear_greeting, chat_id, kind)
+    default = DEFAULT_WELCOME_TEXT if kind == "welcome" else DEFAULT_GOODBYE_TEXT
+    await update.effective_message.reply_text(
+        (f"🗑️ Custom {kind} removed." if removed else f"No custom {kind} was set.") +
+        f"\nThe default is now active for <b>{esc(title)}</b>:\n"
+        f"<code>{esc(default)}</code>",
+        parse_mode=ParseMode.HTML)
+
+
+async def cmd_rmwelcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _remove_greeting(update, context, "welcome")
+
+
+async def cmd_rmgoodbye(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _remove_greeting(update, context, "goodbye")
+
+
 # --------------------------------------------------------------------------- #
 # Utility commands + lifecycle                                                 #
 # --------------------------------------------------------------------------- #
 
+async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List bans recorded by the bot; manual Telegram bans cannot be enumerated."""
+    chat, message = update.effective_chat, update.effective_message
+    db = state(context)[1]
+    bot = bot_of(context)
+    if message is None:
+        return
+    if chat.type == ChatType.PRIVATE:
+        target = await private_management_target(update, context, "can_restrict_members")
+    else:
+        if not await require_right(update, context, "can_restrict_members",
+                                   "view banned members"):
+            return
+        target = (chat.id, await chat_title(bot, chat.id))
+    if not target:
+        return
+    chat_id, title = target
+    rows = await db.run(db.list_bans, chat_id, 40)
+    if not rows:
+        await message.reply_text(
+            f"🚫 No bans recorded for <b>{esc(title)}</b> yet.\n"
+            "<i>Only bans issued through me are recorded; bans made in the Telegram "
+            "admin UI are invisible to bots.</i>", parse_mode=ParseMode.HTML)
+        return
+    lines = []
+    for index, row in enumerate(rows, 1):
+        when = datetime.fromtimestamp(float(row["created_at"]), tz=timezone.utc)
+        lines.append(
+            f"{index}. {mention(int(row['user_id']), row['display_name'] or str(row['user_id']))} "
+            f"· <code>{row['user_id']}</code>\n"
+            f"   <i>{esc(row['reason'] or 'no reason')}</i> · {when:%d %b %Y}")
+    await send_long(bot, update.effective_chat.id,
+                    f"🚫 <b>Banned members</b> — {esc(title)}\n"
+                    f"Recorded: <b>{len(rows)}</b>\n\n" + "\n".join(lines) +
+                    "\n\nLift a ban with <code>/unban &lt;user id&gt;</code>.")
+
+
 HELP_TEXT = """<b>Miss Sona — command list</b>
 
-<b>Moderation (admin)</b>
-/ban /unban /mute /unmute /warn /warns /trust /untrust
+<b>Moderation (specific rights required)</b>
+/ban · /unban · /kick · /mute · /unmute · /warn · /warns
+/ban, /kick, /mute and /warn need the Ban/Restrict members right.
+/banned — recorded permanent bans · /trust · /untrust
+
+<b>Welcome &amp; goodbye</b>
+/welcome · /setwelcome · /rmwelcome
+/goodbye · /setgoodbye · /rmgoodbye
+Default welcome: “Hey {first}, welcome to {group}!”
+A custom message may use {first} {user} {username} {mention} {group} {id} {count}.
+New members verify with the captcha first, then receive the welcome.
+
+<b>Private console</b>
+/connect — group owner or Change group info admins get a private link
+Then use /welcome /setwelcome /rmwelcome /goodbye /setgoodbye
+/rmgoodbye /banned /unban &lt;id&gt; in our private chat. /disconnect to unlink.
 
 <b>Rules &amp; notes</b>
 /setrules /rules /setnote /note /notes /delnote
 
 <b>Announcements</b>
 /shadowreply &lt;text&gt; — repost as the bot (admin/owner)
-@all [message] / @admin [message] — paced mentions (admin)
+@all [message] or /mentionall [message] — every known human,
+    active or dormant (bots never mentioned)
+@admin [message] or /mentionadmin [message] — human administrators only
+/members — inspect the mention roster
+/syncmembers — capture current admins into the roster (admin)
 
 <b>Game</b>
 /new /new4 /new5 /new6 /game /stopgame /top
@@ -1708,9 +2557,15 @@ prohibited text (including text inside images) are removed automatically."""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    args = list(context.args or [])
+    if args and args[0].lower().startswith("connect_"):
+        await complete_connection(update, context, args[0])
+        return
     await update.effective_message.reply_text(
-        "👋 <b>Miss Sona online.</b>\nI handle moderation, rules, notes, anti-spam, "
-        "captcha, broadcasts and word games.\nUse /help for the full command list.",
+        "👋 <b>Miss Sona online.</b>\nI handle moderation, welcome/goodbye messages, "
+        "rules, notes, anti-spam, captcha, broadcasts and word games.\n"
+        "Group owners and admins with <b>Change group info</b> can send /connect in "
+        "their group to manage greetings privately.\nUse /help for the full command list.",
         parse_mode=ParseMode.HTML)
 
 
@@ -1724,7 +2579,7 @@ async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
         "🏓 <b>pong</b> — polling, database and handlers healthy.\n"
         f"<i>{stats['notes']} notes · {stats['warned']} warned users · "
-        f"{stats['active']} tracked members</i>", parse_mode=ParseMode.HTML)
+        f"{stats['roster']} mentionable humans</i>", parse_mode=ParseMode.HTML)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1747,6 +2602,20 @@ async def on_any_group_message(update: Update, context: ContextTypes.DEFAULT_TYP
     if pending:
         await safe_delete(bot_of(context), chat.id, message.message_id)
         raise ApplicationHandlerStop
+
+
+async def on_service_members(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fallback roster capture from new_chat_members / left_chat_member."""
+    message, chat = update.effective_message, update.effective_chat
+    if not message or not chat:
+        return
+    _, db = state(context)
+    for member in message.new_chat_members or []:
+        if member and not member.is_bot:
+            await db.run(db.upsert_member, chat.id, member, True)
+    left = message.left_chat_member
+    if left and not left.is_bot:
+        await db.run(db.mark_member_left, chat.id, left.id)
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1800,24 +2669,40 @@ def register_handlers(application: Application, cfg: Config) -> None:
 
     # -10 runs first for every group message; it only stops unverified users.
     application.add_handler(MessageHandler(groups & filters.ALL, on_any_group_message), group=-10)
+    # -9 captures membership service messages as a fallback roster source.
+    application.add_handler(MessageHandler(
+        groups & (filters.StatusUpdate.NEW_CHAT_MEMBERS | filters.StatusUpdate.LEFT_CHAT_MEMBER),
+        on_service_members), group=-9)
 
     public_commands = {
         "start": cmd_start, "help": cmd_help, "ping": cmd_ping, "id": cmd_id,
     }
     group_commands = {
-        "ban": cmd_ban, "unban": cmd_unban, "mute": cmd_mute, "unmute": cmd_unmute,
+        "ban": cmd_ban, "kick": cmd_kick, "mute": cmd_mute, "unmute": cmd_unmute,
         "warn": cmd_warn, "warns": cmd_warns,
         "setrules": cmd_setrules, "rules": cmd_rules,
         "setnote": cmd_setnote, "note": cmd_note, "notes": cmd_notes, "delnote": cmd_delnote,
         "trust": cmd_trust, "untrust": cmd_untrust,
+        "members": cmd_members, "syncmembers": cmd_syncmembers,
+        "mentionall": on_broadcast, "mentionadmin": on_broadcast,
         "shadowreply": cmd_shadowreply,
         "new": cmd_new, "new4": cmd_new, "new5": cmd_new, "new6": cmd_new,
         "game": cmd_game, "stopgame": cmd_stopgame, "top": cmd_top,
+    }
+    # Available in groups and in the /connect private console.
+    greeting_commands = {
+        "connect": cmd_connect, "disconnect": cmd_disconnect,
+        "welcome": cmd_welcome, "setwelcome": cmd_setwelcome, "rmwelcome": cmd_rmwelcome,
+        "goodbye": cmd_goodbye, "setgoodbye": cmd_setgoodbye, "rmgoodbye": cmd_rmgoodbye,
+        "banned": cmd_banned, "unban": cmd_unban,
     }
     for name, handler in public_commands.items():
         application.add_handler(CommandHandler(name, handler), group=0)
     for name, handler in group_commands.items():
         application.add_handler(CommandHandler(name, handler, filters=groups), group=0)
+    for name, handler in greeting_commands.items():
+        application.add_handler(CommandHandler(
+            name, handler, filters=groups | filters.ChatType.PRIVATE), group=0)
 
     application.add_handler(CallbackQueryHandler(on_captcha_button, pattern=r"^cv:"), group=0)
     application.add_handler(
@@ -1835,7 +2720,7 @@ def register_handlers(application: Application, cfg: Config) -> None:
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.IMAGE),
         on_group_message), group=4)
     logger.info("Registered %d command handlers in 6 handler groups",
-                len(public_commands) + len(group_commands))
+                len(public_commands) + len(group_commands) + len(greeting_commands))
 
 
 def main() -> None:
