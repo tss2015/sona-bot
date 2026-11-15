@@ -12,12 +12,14 @@ Modules
 2. Security & anti-spam     : unapproved http(s)/t.me link removal with a
                               temporary warning, keyword filtering and
                               PyTesseract OCR on images with repeat-offender bans.
+   Global banned-word vault : one SQLite table (banned_words) shared by every
+                              group; the bot owner views/adds/removes terms with
+                              /bannedwords /addword /delword /setwords
+                              /clearbannedwords and changes apply immediately.
 3. Admin broadcasts         : cooldown + lock throttled @all / @admin HTML
                               mentions with a safe 3-second pacing interval.
 4. Captcha verification     : restrict on join, inline button, JobQueue timeout.
-5. Shadow-reply             : group owner and bot owner always allowed; other
-                              admins need /addshadow approval. The command is
-                              deleted and its payload reposted as the bot.
+5. Shadow-reply             : delete admin command, resend payload as the bot.
 6. Word jumble game         : /new /new4 /new5 /new6, 30 guesses, icon hints.
 
 Quick start
@@ -138,6 +140,7 @@ class Config:
     db_path: Path
     warn_limit: int
     content_ban_threshold: int
+    # Initial seed only: the global banned_words SQLite table is authoritative.
     banned_words: tuple[str, ...]
     allowed_domains: frozenset[str]
     link_whitelist: frozenset[int]
@@ -306,6 +309,18 @@ CREATE TABLE IF NOT EXISTS notes (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (chat_id, name)
 );
+-- Global (owner-managed) banned-word vault: intentionally has NO chat_id.
+-- One row per word/phrase, shared by every group the bot serves.
+CREATE TABLE IF NOT EXISTS banned_words (
+    word        TEXT PRIMARY KEY,
+    added_by    INTEGER NOT NULL DEFAULT 0,
+    created_at  REAL NOT NULL
+);
+-- Small key/value store for one-time flags (e.g. banned_words_seeded).
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS warnings (
     chat_id     INTEGER NOT NULL,
     user_id     INTEGER NOT NULL,
@@ -362,16 +377,8 @@ CREATE TABLE IF NOT EXISTS wins (
     updated_at  REAL NOT NULL,
     PRIMARY KEY (chat_id, user_id)
 );
-CREATE TABLE IF NOT EXISTS shadow_approvals (
-    chat_id      INTEGER NOT NULL,
-    user_id      INTEGER NOT NULL,
-    approved_by  INTEGER NOT NULL,
-    created_at   REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
 CREATE INDEX IF NOT EXISTS idx_activity_seen ON activity (chat_id, last_seen DESC);
 CREATE INDEX IF NOT EXISTS idx_wins_chat ON wins (chat_id, wins DESC);
-CREATE INDEX IF NOT EXISTS idx_shadow_chat ON shadow_approvals (chat_id);
 """
 
 
@@ -464,6 +471,96 @@ class Database:
             conn.commit()
             return cursor.rowcount > 0
 
+    # -- global banned-word vault (shared by every chat) --------------------
+    def seed_banned_words(self, words: Iterable[str], added_by: int = 0) -> bool:
+        """Seed initial defaults once, only when the vault has never been seeded.
+
+        Returns True when seeding happened. The ``banned_words_seeded`` flag in
+        the settings table means an owner-cleared vault stays empty after a
+        restart; BANNED_WORDS is never re-applied.
+        """
+        # Store the same canonical form that /addword uses (casefold, folded
+        # confusables, collapsed spaces) so every row is matcher-ready.
+        cleaned = [w for w in dict.fromkeys(normalize(word) for word in words if word) if w]
+        with self._lock:
+            conn = self._connect()
+            marker = conn.execute(
+                "SELECT value FROM settings WHERE key='banned_words_seeded'").fetchone()
+            if marker:
+                return False  # Seeded once already: clearing the vault is permanent.
+            if conn.execute("SELECT COUNT(*) FROM banned_words").fetchone()[0]:
+                seeded = False  # Pre-existing rows win; never duplicate defaults.
+            else:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO banned_words (word, added_by, created_at) "
+                    "VALUES (?, ?, ?)",
+                    [(word, added_by, time.time()) for word in cleaned],
+                )
+                seeded = bool(cleaned)
+            conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('banned_words_seeded', '1')")
+            conn.commit()
+            return seeded
+
+    def list_banned_words(self) -> list[str]:
+        rows = self._query("SELECT word FROM banned_words ORDER BY word",
+                           fetch="all") or []
+        return [str(row["word"]) for row in rows]
+
+    def count_banned_words(self) -> int:
+        row = self._query("SELECT COUNT(*) AS n FROM banned_words", fetch="one")
+        return int(row["n"]) if row else 0
+
+    def add_banned_words(self, words: Iterable[str], added_by: int) -> tuple[list[str], list[str]]:
+        """Add words globally; returns (added, already_present)."""
+        cleaned = list(dict.fromkeys(w for w in words if w))
+        with self._lock:
+            conn = self._connect()
+            existing = {row["word"] for row in conn.execute("SELECT word FROM banned_words")}
+            added = [word for word in cleaned if word not in existing]
+            conn.executemany(
+                "INSERT OR IGNORE INTO banned_words (word, added_by, created_at) VALUES (?, ?, ?)",
+                [(word, added_by, time.time()) for word in added],
+            )
+            conn.commit()
+        return added, [word for word in cleaned if word in existing]
+
+    def remove_banned_words(self, words: Iterable[str]) -> list[str]:
+        cleaned = list(dict.fromkeys(w for w in words if w))
+        if not cleaned:
+            return []
+        placeholders = ",".join("?" for _ in cleaned)
+        with self._lock:
+            conn = self._connect()
+            existing = {
+                row["word"] for row in conn.execute(
+                    f"SELECT word FROM banned_words WHERE word IN ({placeholders})", cleaned
+                )
+            }
+            conn.execute(f"DELETE FROM banned_words WHERE word IN ({placeholders})", cleaned)
+            conn.commit()
+        return [word for word in cleaned if word in existing]
+
+    def replace_banned_words(self, words: Iterable[str], added_by: int) -> int:
+        cleaned = list(dict.fromkeys(w for w in words if w))
+        with self._lock:
+            conn = self._connect()
+            conn.execute("DELETE FROM banned_words")
+            conn.executemany(
+                "INSERT OR IGNORE INTO banned_words (word, added_by, created_at) VALUES (?, ?, ?)",
+                [(word, added_by, time.time()) for word in cleaned],
+            )
+            conn.commit()
+        return len(cleaned)
+
+    def clear_banned_words(self) -> int:
+        with self._lock:
+            conn = self._connect()
+            removed = conn.execute("SELECT COUNT(*) FROM banned_words").fetchone()[0]
+            conn.execute("DELETE FROM banned_words")
+            conn.commit()
+            return int(removed)
+
     # -- strikes ------------------------------------------------------------
     def add_warn(self, chat_id: int, user_id: int) -> int:
         return self._bump("warnings", chat_id, user_id)
@@ -517,40 +614,6 @@ class Database:
     def is_link_trusted(self, chat_id: int, user_id: int) -> bool:
         return self._query("SELECT 1 FROM link_trust WHERE chat_id=? AND user_id=?",
                            (chat_id, user_id), fetch="one") is not None
-
-    # -- shadow reply approvals --------------------------------------------
-    def set_shadow_approval(self, chat_id: int, user_id: int, approved_by: int) -> None:
-        self._query(
-            "INSERT INTO shadow_approvals (chat_id, user_id, approved_by, created_at) "
-            "VALUES (?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
-            "approved_by=excluded.approved_by, created_at=excluded.created_at",
-            (chat_id, user_id, approved_by, time.time()),
-        )
-
-    def remove_shadow_approval(self, chat_id: int, user_id: int) -> bool:
-        with self._lock:
-            conn = self._connect()
-            cursor = conn.execute(
-                "DELETE FROM shadow_approvals WHERE chat_id=? AND user_id=?",
-                (chat_id, user_id),
-            )
-            conn.commit()
-            return cursor.rowcount > 0
-
-    def is_shadow_approved(self, chat_id: int, user_id: int) -> bool:
-        return self._query(
-            "SELECT 1 FROM shadow_approvals WHERE chat_id=? AND user_id=?",
-            (chat_id, user_id), fetch="one",
-        ) is not None
-
-    def list_shadow_approvals(self, chat_id: int) -> list[dict]:
-        return self._query(
-            "SELECT s.user_id, s.approved_by, s.created_at, "
-            "COALESCE(a.name, '') AS name, COALESCE(a.username, '') AS username "
-            "FROM shadow_approvals s "
-            "LEFT JOIN activity a ON a.chat_id=s.chat_id AND a.user_id=s.user_id "
-            "WHERE s.chat_id=? ORDER BY s.created_at", (chat_id,), fetch="all",
-        ) or []
 
     # -- activity -----------------------------------------------------------
     def touch_activity(self, chat_id: int, user: Any) -> None:
@@ -716,6 +779,27 @@ def spawn(coro, application: Optional[Application] = None) -> asyncio.Task:
     return task
 
 
+async def refresh_matcher(application: Application) -> list[str]:
+    """Reload the shared vault from SQLite and swap in a fresh matcher.
+
+    Handlers read ``bot_data["matcher"]`` on every message, so replacing the
+    object makes owner edits effective immediately in every group.
+    """
+    db: Database = application.bot_data["db"]
+    words = await db.run(db.list_banned_words)
+    application.bot_data["matcher"] = KeywordMatcher(words)
+    logger.info("Banned-word matcher refreshed (%d global entries)", len(words))
+    return words
+
+
+async def refresh_banned_words_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic safety net for edits made directly in SQLite by an operator."""
+    try:
+        await refresh_matcher(context.application)
+    except Exception as exc:  # Keep the scheduler alive through transient DB errors.
+        logger.warning("Could not refresh banned words from the database: %s", exc)
+
+
 async def safe_delete(bot, chat_id: int, message_id: int) -> bool:
     try:
         return bool(await bot.delete_message(chat_id=chat_id, message_id=message_id))
@@ -775,51 +859,6 @@ async def is_admin(bot, chat_id: int, user_id: int, ttl: float = 45.0) -> bool:
 
 async def is_privileged(bot, chat_id: int, user_id: int, cfg: Config) -> bool:
     return user_id in cfg.owner_ids or await is_admin(bot, chat_id, user_id)
-
-
-async def is_chat_creator(bot, chat_id: int, user_id: int) -> bool:
-    """Live group-owner check (not cached, so ownership changes apply at once)."""
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        return member.status == ChatMemberStatus.CREATOR
-    except TelegramError as exc:
-        logger.debug("Creator lookup failed for %s in %s: %s", user_id, chat_id, exc)
-        return False
-
-
-async def shadow_role(bot, db: Database, chat_id: int, user_id: int,
-                      cfg: Config) -> Optional[str]:
-    """Return why a user may use /shadowreply, or None when unapproved.
-
-    The configured bot owner(s) and the group owner always have access.
-    Every other group admin must be explicitly approved with /addshadow.
-    """
-    if user_id in cfg.owner_ids:
-        return "bot owner"
-    if await is_chat_creator(bot, chat_id, user_id):
-        return "group owner"
-    if await db.run(db.is_shadow_approved, chat_id, user_id) and \
-            await is_admin(bot, chat_id, user_id):
-        return "approved admin"
-    return None
-
-
-async def require_shadow_approver(update: Update,
-                                  context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Approval is restricted to the group owner (creator) or a bot owner."""
-    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
-    if not chat or not user or not message:
-        return False
-    if chat.type not in GROUP_TYPES:
-        await message.reply_text("Shadow approvals only work inside groups.")
-        return False
-    cfg, _ = state(context)
-    if user.id in cfg.owner_ids or await is_chat_creator(bot_of(context), chat.id, user.id):
-        return True
-    await message.reply_text(
-        "🔒 Only the <b>group owner</b> or the <b>bot owner</b> can approve or revoke "
-        "shadow-reply admins.", parse_mode=ParseMode.HTML)
-    return False
 
 
 async def default_permissions(bot, chat_id: int) -> ChatPermissions:
@@ -1189,6 +1228,174 @@ async def cmd_untrust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 
 # --------------------------------------------------------------------------- #
+# 1c. Owner-only global banned-word vault                                      #
+# --------------------------------------------------------------------------- #
+
+WORD_INPUT_SPLIT = re.compile(r"[,;\n]+")
+WORD_VALID_RE = re.compile(r"^[a-z0-9][a-z0-9 ]*$")
+
+
+async def require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                        action: str = "manage banned words") -> bool:
+    """The shared vault is global, so only bot owners may read or modify it."""
+    user, message = update.effective_user, update.effective_message
+    if not user or not message:
+        return False
+    cfg, _ = state(context)
+    if user.id in cfg.owner_ids:
+        return True
+    await message.reply_text(
+        f"🔒 Only the bot owner can {action}. "
+        "The banned-word vault is global and affects every group.",
+        parse_mode=ParseMode.HTML)
+    return False
+
+
+def parse_word_input(payload: str) -> tuple[list[str], list[str]]:
+    """Normalise comma/semicolon/newline separated words into stored form."""
+    valid: list[str] = []
+    invalid: list[str] = []
+    for raw in WORD_INPUT_SPLIT.split(payload or ""):
+        if not raw.strip():
+            continue
+        word = normalize(raw).strip()
+        if 2 <= len(word) <= 64 and WORD_VALID_RE.fullmatch(word):
+            if word not in valid:
+                valid.append(word)
+        else:
+            invalid.append(raw.strip())
+    return valid, invalid
+
+
+def words_html(words: Iterable[str], limit: int = 80) -> str:
+    items = list(words)
+    text = ", ".join(f"<code>{esc(word)}</code>" for word in items[:limit])
+    if len(items) > limit:
+        text += f" …and {len(items) - limit} more"
+    return text or "<i>(none)</i>"
+
+
+async def cmd_bannedwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show the shared vault. Available to the bot owner in any chat."""
+    if not await require_owner(update, context, "view the banned-word vault"):
+        return
+    _, db = state(context)
+    words = await db.run(db.list_banned_words)
+    if not words:
+        await update.effective_message.reply_text(
+            "🚫 <b>The shared banned-word vault is empty.</b>\n"
+            "Add words with <code>/addword word1, word2</code> — they apply to every group.",
+            parse_mode=ParseMode.HTML)
+        return
+    body = (
+        "🚫 <b>Global banned-word vault</b>\n"
+        "<i>One shared SQLite list — no per-group copies. Changes apply to every group.</i>\n\n"
+        f"<b>{len(words)}</b> entries:\n{words_html(words)}\n\n"
+        "<b>Owner commands</b>\n"
+        "/addword word1, word2 · /delword word · /setwords word1, word2 · /clearbannedwords"
+    )
+    bot, chat, user = bot_of(context), update.effective_chat, update.effective_user
+    if chat.type != ChatType.PRIVATE:
+        # Never publish a moderation list to the whole group: send it to the owner.
+        try:
+            await send_long(bot, user.id, f"{body}\n\n<i>Chat {chat.id}</i>")
+            await update.effective_message.reply_text("📬 The shared vault was sent to your DM.")
+        except (Forbidden, BadRequest):
+            await update.effective_message.reply_text(
+                "📬 I can't message you privately yet. Start a chat with me (/start), "
+                "then run /bannedwords there.")
+        return
+    await send_long(bot, chat.id, body)
+
+
+async def cmd_addword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Add one or more terms to the global vault (owner only)."""
+    if not await require_owner(update, context, "add banned words"):
+        return
+    message = update.effective_message
+    valid, invalid = parse_word_input(command_payload(message))
+    if not valid:
+        await message.reply_text(
+            "Usage: <code>/addword casino-spam, free-crypto</code>\n"
+            "Separate terms with commas or new lines. Terms are 2–64 characters.",
+            parse_mode=ParseMode.HTML)
+        return
+    _, db = state(context)
+    added, existing = await db.run(db.add_banned_words, valid, update.effective_user.id)
+    total = len(await refresh_matcher(context.application))
+    lines: list[str] = []
+    if added:
+        lines.append(f"✅ Added <b>{len(added)}</b>: {words_html(added)}")
+    if existing:
+        lines.append(f"ℹ️ Already present: {words_html(existing)}")
+    if invalid:
+        lines.append(f"⚠️ Invalid or too short: {esc(', '.join(invalid))}")
+    lines.append(f"🌍 The shared vault now has <b>{total}</b> entries and is live in every group.")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_delword(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Remove terms from the global vault (owner only)."""
+    if not await require_owner(update, context, "remove banned words"):
+        return
+    message = update.effective_message
+    valid, invalid = parse_word_input(command_payload(message))
+    if not valid:
+        await message.reply_text(
+            "Usage: <code>/delword casino-spam</code> (commas allowed).",
+            parse_mode=ParseMode.HTML)
+        return
+    _, db = state(context)
+    removed = await db.run(db.remove_banned_words, valid)
+    total = len(await refresh_matcher(context.application))
+    not_found = [word for word in valid if word not in removed]
+    lines: list[str] = []
+    if removed:
+        lines.append(f"🗑️ Removed <b>{len(removed)}</b>: {words_html(removed)}")
+    if not_found:
+        lines.append(f"ℹ️ Not in the vault: {words_html(not_found)}")
+    if invalid:
+        lines.append(f"⚠️ Invalid: {esc(', '.join(invalid))}")
+    lines.append(f"🌍 The shared vault now has <b>{total}</b> entries.")
+    await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def cmd_setwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Atomically replace the whole global vault (owner only)."""
+    if not await require_owner(update, context, "replace the banned-word vault"):
+        return
+    message = update.effective_message
+    valid, invalid = parse_word_input(command_payload(message))
+    if not valid:
+        await message.reply_text(
+            "Usage: <code>/setwords word1, word2, word3</code>\n"
+            "This replaces the entire shared list. Use /clearbannedwords to empty it.",
+            parse_mode=ParseMode.HTML)
+        return
+    _, db = state(context)
+    count = await db.run(db.replace_banned_words, valid, update.effective_user.id)
+    await refresh_matcher(context.application)
+    extra = f"\n⚠️ Ignored invalid: {esc(', '.join(invalid))}" if invalid else ""
+    await message.reply_text(
+        f"✅ Shared vault replaced with <b>{count}</b> entries.{extra}\n"
+        "<i>All groups now use exactly this list.</i>", parse_mode=ParseMode.HTML)
+
+
+async def cmd_clearbannedwords(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Empty the global vault (owner only)."""
+    if not await require_owner(update, context, "clear the banned-word vault"):
+        return
+    _, db = state(context)
+    removed = await db.run(db.clear_banned_words)
+    await refresh_matcher(context.application)
+    await update.effective_message.reply_text(
+        f"🧹 Removed <b>{removed}</b> entries. The vault is now empty — keyword and OCR "
+        "matching is disabled until words are added again (link filtering still runs).\n"
+        "<i>This persists across restarts: BANNED_WORDS is never re-applied.</i>",
+        parse_mode=ParseMode.HTML)
+
+
+# --------------------------------------------------------------------------- #
 # 2. Link / keyword / OCR safeguards                                           #
 # --------------------------------------------------------------------------- #
 
@@ -1501,19 +1708,13 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not change or not change.new_chat_member:
         return
     old, new = change.old_chat_member, change.new_chat_member
-    chat, user = change.chat, new.user
-    cfg, db = state(context)
-    # Security: a demoted/removed admin immediately loses shadow-reply approval.
-    if old.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR) and \
-            new.status not in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR):
-        await db.run(db.remove_shadow_approval, chat.id, user.id)
-        logger.info("shadow approval auto-revoked after demotion chat=%s user=%s",
-                    chat.id, user.id)
     if memberish(old) or not memberish(new):
         return
-    if user.is_bot or user.id in cfg.owner_ids:
+    user, chat = new.user, change.chat
+    if user.is_bot or user.id in state(context)[0].owner_ids:
         return
     bot = bot_of(context)
+    cfg, db = state(context)
     try:
         await bot.restrict_chat_member(chat_id=chat.id, user_id=user.id,
                                        permissions=ChatPermissions.no_permissions())
@@ -1587,119 +1788,13 @@ async def on_captcha_button(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 # --------------------------------------------------------------------------- #
-# 5. Shadow-reply approvals + proxy messaging                                  #
+# 5. Shadow-reply / proxy messaging                                            #
 # --------------------------------------------------------------------------- #
 
-async def cmd_addshadow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group owner / bot owner: approve one current admin for /shadowreply."""
-    if not await require_shadow_approver(update, context):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    cfg, db = state(context)
-    bot = bot_of(context)
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text(
-            "Usage: reply to an admin with <code>/addshadow</code>, "
-            "or use <code>/addshadow 123456789</code>.", parse_mode=ParseMode.HTML)
-        return
-    if target_id == getattr(bot, "id", None):
-        await message.reply_text("The bot already speaks as itself 🙂")
-        return
-    if target_id in cfg.owner_ids or await is_chat_creator(bot, chat.id, target_id):
-        await message.reply_text(
-            f"ℹ️ {mention(target_id, name)} is a bot owner or the group owner and "
-            "already has shadow-reply access by default.", parse_mode=ParseMode.HTML)
-        return
-    # ttl=0 forces a fresh lookup: a just-promoted admin must be approvable now.
-    if not await is_admin(bot, chat.id, target_id, ttl=0.0):
-        await message.reply_text(
-            "Only current group administrators can be approved for shadow reply. "
-            "Promote this member first.", parse_mode=ParseMode.HTML)
-        return
-    await db.run(db.set_shadow_approval, chat.id, target_id, update.effective_user.id)
-    await message.reply_text(
-        f"✅ {mention(target_id, name)} approved for <b>shadow reply</b>.\n"
-        "<i>They can now use /shadowreply. Revoke with /removeshadow.</i>",
-        parse_mode=ParseMode.HTML)
-    logger.info("shadow approval chat=%s target=%s by=%s", chat.id, target_id,
-                update.effective_user.id)
-
-
-async def cmd_removeshadow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group owner / bot owner: revoke an admin's individually granted access."""
-    if not await require_shadow_approver(update, context):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    cfg, db = state(context)
-    bot = bot_of(context)
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text(
-            "Usage: reply to an approved admin with <code>/removeshadow</code>.",
-            parse_mode=ParseMode.HTML)
-        return
-    if target_id in cfg.owner_ids or await is_chat_creator(bot, chat.id, target_id):
-        await message.reply_text(
-            "The bot owner and group owner have built-in shadow-reply access "
-            "and cannot be revoked here.", parse_mode=ParseMode.HTML)
-        return
-    removed = await db.run(db.remove_shadow_approval, chat.id, target_id)
-    if removed:
-        text = f"🗑️ Shadow-reply access revoked for {mention(target_id, name)}."
-        logger.info("shadow revoked chat=%s target=%s by=%s", chat.id, target_id,
-                    update.effective_user.id)
-    else:
-        text = f"{mention(target_id, name)} was not individually approved."
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def cmd_shadowadmins(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group owner / bot owner: show built-in and approved shadow operators."""
-    if not await require_shadow_approver(update, context):
-        return
-    chat = update.effective_chat
-    cfg, db = state(context)
-    bot = bot_of(context)
-    lines = ["🕶️ <b>Shadow-reply access</b>", "", "<b>Built-in (always allowed)</b>"]
-    try:
-        admins = await bot.get_chat_administrators(chat.id)
-        for admin in admins:
-            if admin.status == ChatMemberStatus.CREATOR and admin.user:
-                lines.append("• " + mention(admin.user.id, admin.user.full_name) + " — group owner")
-    except TelegramError as exc:
-        logger.debug("Could not read group owner in %s: %s", chat.id, exc)
-    for owner_id in sorted(cfg.owner_ids)[:10]:
-        lines.append("• " + mention(owner_id, "Bot owner") + f" — <code>{owner_id}</code>")
-    approved = await db.run(db.list_shadow_approvals, chat.id)
-    lines.append("")
-    lines.append("<b>Approved admins</b>" if approved else "<b>Approved admins:</b> none yet")
-    for row in approved:
-        label = row["name"] or row["username"] or str(row["user_id"])
-        lines.append("• " + mention(int(row["user_id"]), label))
-    lines.append("")
-    lines.append("<i>Approve with /addshadow (reply to an admin) · revoke with /removeshadow.</i>")
-    await send_long(bot, chat.id, "\n".join(lines))
-
-
 async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete the command and republish the payload as the bot itself.
-
-    The group owner and configured bot owner(s) are always allowed. A regular
-    group admin must first be approved by the owner with /addshadow.
-    """
+    """Delete the admin's command and republish the payload as the bot itself."""
     message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if chat.type not in GROUP_TYPES:
-        await message.reply_text("Shadow reply only works in groups.")
-        return
-    cfg, db = state(context)
-    bot = bot_of(context)
-    role = await shadow_role(bot, db, chat.id, user.id, cfg)
-    if role is None:
-        await message.reply_text(
-            f"🔒 <b>Shadow reply is locked</b> for {mention(user.id, user.full_name)}.\n"
-            "The <b>group owner</b> or <b>bot owner</b> must approve you with "
-            "<code>/addshadow</code> first.", parse_mode=ParseMode.HTML)
+    if not await require_admin(update, context, "use shadow replies"):
         return
     raw_html = getattr(message, "text_html", None) or esc(message.text or "")
     # Strip only the leading command (including an optional @BotUsername).
@@ -1714,6 +1809,7 @@ async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await message.reply_text("⏳ Please wait a moment before another shadow reply.")
         return
     SHADOW_LAST[user.id] = time.monotonic()
+    bot = bot_of(context)
     await safe_delete(bot, chat.id, message.message_id)
     try:
         # Sent by the bot's own identity: the original admin is not the author.
@@ -1721,7 +1817,7 @@ async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except BadRequest:
         # Fallback for exotic entity combinations: resend as plain text.
         await bot.send_message(chat_id=chat.id, text=command_payload(message))
-    logger.info("shadow reply chat=%s by=%s role=%s", chat.id, user.id, role)
+    logger.info("shadow reply chat=%s by=%s", chat.id, user.id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1870,9 +1966,16 @@ HELP_TEXT = """<b>Miss Sona — command list</b>
 /setrules /rules /setnote /note /notes /delnote
 
 <b>Announcements</b>
-/addshadow /removeshadow /shadowadmins — owner-only access control
-/shadowreply &lt;text&gt; — repost as the bot (owner or approved admin)
+/shadowreply &lt;text&gt; — repost as the bot (admin/owner)
 @all [message] / @admin [message] — paced mentions (admin)
+
+<b>Banned-word vault (bot owner only)</b>
+/bannedwords — view the shared list (DM recommended)
+/addword word1, word2 — add words
+/delword word — remove words
+/setwords word1, word2 — replace the list
+/clearbannedwords — empty the vault
+The list is global: every group uses the same database entries.
 
 <b>Game</b>
 /new /new4 /new5 /new6 /game /stopgame /top
@@ -1883,10 +1986,7 @@ Send a plain word of the right length to guess.
 /start /help /ping /id
 
 New members must complete the 2-minute captcha. Unapproved links and
-prohibited text (including text inside images) are removed automatically.
-
-The group owner and bot owner always have shadow reply. Other group admins
-must be approved with /addshadow before /shadowreply will work."""
+prohibited text (including text inside images) are removed automatically."""
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1903,10 +2003,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     _, db = state(context)
     stats = await db.run(db.dashboard, update.effective_chat.id)
+    banned = await db.run(db.count_banned_words)
     await update.effective_message.reply_text(
         "🏓 <b>pong</b> — polling, database and handlers healthy.\n"
         f"<i>{stats['notes']} notes · {stats['warned']} warned users · "
-        f"{stats['active']} tracked members</i>", parse_mode=ParseMode.HTML)
+        f"{stats['active']} tracked members · {banned} global banned words</i>",
+        parse_mode=ParseMode.HTML)
 
 
 async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1954,6 +2056,13 @@ async def post_init(application: Application) -> None:
     if cfg.tesseract_cmd and OCR_AVAILABLE and pytesseract is not None:
         pytesseract.pytesseract.tesseract_cmd = cfg.tesseract_cmd
     await db.run(db.init_schema)
+    # The database is authoritative. BANNED_WORDS only seeds an empty vault once.
+    seeded = await db.run(db.seed_banned_words, cfg.banned_words, 0)
+    words = await refresh_matcher(application)
+    if application.job_queue:
+        # Pick up manual SQLite edits without a restart.
+        application.job_queue.run_repeating(
+            refresh_banned_words_job, interval=300, first=300, name="banned-words-refresh")
     # Restart safety: re-arm timeouts for users still awaiting verification.
     pending = await db.run(db.pending_captchas)
     now = time.time()
@@ -1961,13 +2070,11 @@ async def post_init(application: Application) -> None:
         remaining = max(1.0, float(cfg.captcha_timeout) - (now - float(row["created_at"])))
         schedule_captcha_timeout(application, int(row["chat_id"]), int(row["user_id"]),
                                  str(row["token"]), remaining)
-    try:
-        await application.bot.set_my_name(name="Miss Sona")
-    except TelegramError as exc:
-        logger.warning("Could not set Telegram display name to Miss Sona: %s", exc)
     me = await application.bot.get_me()
-    logger.info("Miss Sona @%s ready | OCR=%s | DB=%s | pending captchas=%d | owners=%d",
+    logger.info("Miss Sona @%s ready | OCR=%s | DB=%s | banned words=%d%s | "
+                "pending captchas=%d | owners=%d",
                 me.username, "on" if OCR_AVAILABLE else "off", cfg.db_path,
+                len(words), " (seeded from env)" if seeded else "",
                 len(pending), len(cfg.owner_ids))
 
 
@@ -1997,8 +2104,6 @@ def register_handlers(application: Application, cfg: Config) -> None:
         "setnote": cmd_setnote, "note": cmd_note, "notes": cmd_notes, "delnote": cmd_delnote,
         "trust": cmd_trust, "untrust": cmd_untrust,
         "shadowreply": cmd_shadowreply,
-        "addshadow": cmd_addshadow, "removeshadow": cmd_removeshadow,
-        "shadowadmins": cmd_shadowadmins,
         "new": cmd_new, "new4": cmd_new, "new5": cmd_new, "new6": cmd_new,
         "game": cmd_game, "stopgame": cmd_stopgame, "top": cmd_top,
     }
@@ -2006,6 +2111,17 @@ def register_handlers(application: Application, cfg: Config) -> None:
         application.add_handler(CommandHandler(name, handler), group=0)
     for name, handler in group_commands.items():
         application.add_handler(CommandHandler(name, handler, filters=groups), group=0)
+
+    # Owner commands work in private chat and in groups; the vault is global.
+    owner_commands = {
+        "bannedwords": cmd_bannedwords,
+        "addword": cmd_addword,
+        "delword": cmd_delword,
+        "setwords": cmd_setwords,
+        "clearbannedwords": cmd_clearbannedwords,
+    }
+    for name, handler in owner_commands.items():
+        application.add_handler(CommandHandler(name, handler), group=0)
 
     application.add_handler(CallbackQueryHandler(on_captcha_button, pattern=r"^cv:"), group=0)
     application.add_handler(
@@ -2023,7 +2139,7 @@ def register_handlers(application: Application, cfg: Config) -> None:
         (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.IMAGE),
         on_group_message), group=4)
     logger.info("Registered %d command handlers in 6 handler groups",
-                len(public_commands) + len(group_commands))
+                len(public_commands) + len(group_commands) + len(owner_commands))
 
 
 def main() -> None:
