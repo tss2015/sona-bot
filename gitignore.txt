@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+.env
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+miss_sona.db
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# OCR temp
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
