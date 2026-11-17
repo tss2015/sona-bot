@@ -1,4 +1,13 @@
-python-telegram-bot[job-queue]>=21.0,<22.0
-python-dotenv>=1.0.0
+# Miss Sona — Dependencies
+# Core (required)
+python-telegram-bot[job-queue]>=20.8,<23.0
+
+# AI-OCR Safety Pipeline (optional but recommended)
 Pillow>=10.0.0
 pytesseract>=0.3.10
+
+# Standard library covers: asyncio, sqlite3, logging, re, html, etc.
+# No other external dependencies required.
+# ────────────────────────────────────────────
+# Install: pip install -r requirements.txt
+# OCR binary (system): sudo apt install tesseract-ocr
