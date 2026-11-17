@@ -1,66 +1,73 @@
-name: Miss Sona 4-Hour Rotation Shift
+name: Telegram Userbot - 5 Hour Rotation
 
 on:
+  workflow_dispatch:
   schedule:
-    # Runs every 4 hours (at 00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
-    - cron: '0 */4 * * *'
-  workflow_dispatch: # Allows manual start from the Actions tab
+    - cron: "0 */5 * * *"
 
 permissions:
-  contents: write # Required to save and push miss_sona.db back to the repo
+  contents: read
+
+concurrency:
+  group: telegram-userbot-rotation
+  cancel-in-progress: true
 
 jobs:
-  run-bot-shift:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 250 # Safety buffer slightly above the 240-minute (4h) shift
+    timeout-minutes: 285
+    env:
+      BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+      API_ID: ${{ secrets.API_ID }}
+      API_HASH: ${{ secrets.API_HASH }}
+      MONGO_URI: ${{ secrets.MONGO_URI }}
+      SESSION_ENCRYPTION_KEY: ${{ secrets.SESSION_ENCRYPTION_KEY }}
+      ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+      TAG_DELAY: ${{ vars.TAG_DELAY || '5' }}
+      TAG_BATCH_SIZE: ${{ vars.TAG_BATCH_SIZE || '1' }}
+      MAX_MEMBERS_PER_TASK: ${{ vars.MAX_MEMBERS_PER_TASK || '5000' }}
+      HEALTH_PORT: "8080"
+      LOG_LEVEL: INFO
+      DATABASE_NAME: telegram_userbot
+      PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
         with:
-          fetch-depth: 1
+          python-version: "3.12"
+          cache: pip
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-          cache: 'pip'
-
-      - name: Install System Dependencies (Tesseract OCR)
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y tesseract-ocr
-
-      - name: Install Python Dependencies
+      - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install "python-telegram-bot[job-queue]>=20.8" Pillow pytesseract
+          pip install -r requirements.txt
 
-      - name: Run Miss Sona Bot (4-Hour Shift)
+      - name: Validate secrets
+        shell: bash
+        run: |
+          for name in BOT_TOKEN API_ID API_HASH MONGO_URI SESSION_ENCRYPTION_KEY; do
+            test -n "${!name}" || {
+              echo "::error::$name is missing"
+              exit 1
+            }
+          done
+
+      - name: Compile
         env:
-          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
-          OWNER_ID: ${{ secrets.OWNER_ID }}
-          DB_PATH: "miss_sona.db"
-        run: |
-          echo "Starting 4-hour shift for Miss Sona..."
-          # Run the bot for 3 hours 55 minutes (14100s) to leave 5 mins for DB backup & handoff
-          # Sends SIGINT (Ctrl+C) so PTB shuts down gracefully and closes SQLite WAL
-          timeout -s SIGINT 14100s python miss_sona.py || true
-          echo "Shift complete. Preparing database backup..."
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m compileall -q .
 
-      - name: Persist SQLite Database
-        if: always() # Runs even if the step above timed out or exited
+      - name: Tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: pytest -q
+
+      - name: Run bot
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
-          git config --local user.email "github-actions[bot]@users.noreply.github.com"
-          git config --local user.name "github-actions[bot]"
-          
-          # Force SQLite WAL checkpoint so all data is merged into miss_sona.db
-          python3 -c "import sqlite3; con=sqlite3.connect('miss_sona.db'); con.execute('PRAGMA wal_checkpoint(TRUNCATE);'); con.close()" || true
-          
-          git add miss_sona.db
-          if ! git diff --staged --quiet; then
-            git commit -m "chore(db): backup miss_sona.db after 4h rotation shift"
-            git push
-          else
-            echo "No database changes to commit."
-          fi
+          echo "Rotation started: $(date -u)"
+          # Runs the bot for 4 hours 45 minutes (17100s), sending SIGINT for a clean shutdown before the 5h mark
+          timeout --signal=TERM --kill-after=30s 17100s python bot.py
