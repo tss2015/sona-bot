@@ -1,0 +1,18 @@
+version: "3.9"
+services:
+  miss-sona:
+    build: .
+    container_name: miss-sona
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./miss_sona.db:/app/miss_sona.db  # alt: single file mount
+    environment:
+      - DB_PATH=/app/data/miss_sona.db
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
