@@ -3,7 +3,7 @@
 Miss Sona v3.0 — Industrial-Grade Telegram Group Management Bot
 ===========================================================
 By The Secret Squad Community | python-telegram-bot v20+ | asyncio + SQLite WAL
-Single-file production-ready | Miss Rose Full Parity + Custom Industrial Modules
+Single-file production-ready | Miss Sona Full Parity + Custom Industrial Modules
 
 Setup:
   pip install "python-telegram-bot[job-queue]>=20.8" Pillow pytesseract
@@ -1121,7 +1121,7 @@ async def cmd_import(update,context):
 
 # ── Utility ──
 async def cmd_start(update,context):
-    await update.effective_message.reply_html(branded("✨ <b>Miss Sona — The Secret Squad Guardian</b> ✨\n\nRose-parity + industrial modules.\n<b>Mod:</b> /ban /tban /mute /warn /promote /adminlist (all via reply/@ID)\n<b>Approve:</b> /approve /unapprove (via reply/@ID)\n<b>Locks:</b> /lock /unlock /locks /allowlist /setflood\n<b>Welcome:</b> /setwelcome {fullname} /welcome on + CAPTCHA ✅\n<b>Vault:</b> /addbword /listbwords (owner)\n<b>Broadcast:</b> /all /admins 5/3s\n<b>Shadow:</b> /shadowreply\n<b>Game:</b> /new /new4 /new5 /new6 /game /top — 📚 Stack Emojify Board\n<b>Support:</b> /support /setlog (logs all actions)\n<b>Utility:</b> /connect (DM), /export /import, /disable"))
+    await update.effective_message.reply_html(branded("✨ <b>Miss Sona — Your Ultimate group Guardian</b> ✨\n\n industrial modules ai backed bot.\n<b>Mod:</b> /ban /tban /mute /warn /promote /adminlist (all via reply/@ID)\n<b>Approve:</b> /approve /unapprove (via reply/@ID)\n<b>Locks:</b> /lock /unlock /locks /allowlist /setflood\n<b>Welcome:</b> /setwelcome {fullname} /welcome on + CAPTCHA ✅\n<b>Vault:</b> /addbword /listbwords (owner)\n<b>Broadcast:</b> /all /admins 5/3s\n<b>Shadow:</b> /shadowreply\n<b>Game:</b> /new /new4 /new5 /new6 /game /top — 📚 Stack Emojify Board\n<b>Support:</b> /support /setlog (logs all actions)\n<b>Utility:</b> /connect (DM), /export /import, /disable"))
 async def cmd_help(update,context): await cmd_start(update,context)
 async def cmd_id(update,context):
     msg=update.effective_message; chat=update.effective_chat; user=update.effective_user
