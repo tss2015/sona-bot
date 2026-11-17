@@ -1,2448 +1,1667 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 """
-Miss Sona - all-in-one Telegram group management and gaming bot.
+Miss Sona — Industrial-Grade Telegram Group Management Bot
+===========================================================
+Elite software architecture | python-telegram-bot v20+ | asyncio + SQLite (WAL)
 
-Single-file deployment blueprint built on python-telegram-bot v20+/v21.x.
+Features:
+  • Core moderation: /ban /unban /mute /unmute /warn (3-strike auto-ban) + /rules /setrules /note /setnote /delnote + /trust /untrust
+  • SQLite persistence via asyncio.to_thread with WAL + composite primary keys
+  • Granular locks: anti-link, anti-spam, banned-word vault (owner global sync)
+  • AI-OCR Safety Pipeline: Pillow + Tesseract OCR — deletes prohibited/illegal text in photos/files
+  • Interactive CAPTCHA gate with JobQueue timeout + activity pool
+  • Throttled mass mentions: @all / @admin in batches of 5 users every 3s
+  • Shadow-Reply: /shadowreply for anonymous admin sends
+  • Multiplayer Wordle/Jumble: /new /new4 /new5 /new6 + /top /game
 
-Modules
--------
-1. Moderation & persistence : /ban /mute /unmute /warn (3 strikes -> ban),
-                              /setrules /rules /setnote /note in SQLite.
-2. Security & anti-spam     : unapproved http(s)/t.me link removal with a
-                              temporary warning, keyword filtering and
-                              PyTesseract OCR on images with repeat-offender bans.
-3. Admin broadcasts         : cooldown + lock throttled @all / @admin HTML
-                              mentions with a safe 3-second pacing interval.
-4. Captcha verification     : restrict on join, inline button, JobQueue timeout.
-5. Shadow-reply             : delete admin command, resend payload as the bot.
-6. Word jumble game         : /new /new4 /new5 /new6, 30 guesses, icon hints.
+Setup:
+  pip install "python-telegram-bot[job-queue]>=20.8" Pillow pytesseract
+  # Linux OCR binary: sudo apt install tesseract-ocr
+  export BOT_TOKEN="your_bot_token"
+  export OWNER_ID="123456789"   # optional, Telegram user ID of bot owner
+  python miss_sona.py
 
-Quick start
------------
-    pip install -r requirements.txt          # includes [job-queue]
-    sudo apt install tesseract-ocr           # system binary for OCR
-    cp .env.example .env && edit .env
-    python bot.py
-
-The bot MUST be a group administrator with "Delete messages", "Ban users" and
-"Restrict members" rights. Captcha/moderation require a supergroup. Disable
-privacy mode via @BotFather so the bot receives ordinary group messages.
-
-Design notes
-------------
-* All handlers are async; all SQLite work runs through asyncio.to_thread.
-* One SQLite connection guarded by an RLock, WAL journal, idempotent schema.
-* Handler groups are explicit so guesses/broadcasts never hit the text filter.
-* Every Telegram API call is wrapped in targeted error handling: a missing
-  permission or a deleted message must never crash the polling loop.
+Zero external dependencies beyond python-telegram-bot + Pillow + pytesseract (both optional with graceful fallback).
 """
-
 from __future__ import annotations
 
 import asyncio
+import datetime
 import html
-import json
+import io
 import logging
 import os
+import random
 import re
-import secrets
 import sqlite3
-import threading
-import time
-import unicodedata
-from collections import Counter
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from io import BytesIO
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Callable, Iterable, Optional
-from urllib.parse import urlparse
+from typing import Optional, List, Tuple
 
-try:  # Optional convenience: python-dotenv is in requirements.txt
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:  # pragma: no cover - env vars work without it
-    pass
+# ──────────────────────────────────────────
+# Optional OCR imports (graceful fallback)
+# ──────────────────────────────────────────
+try:
+    from PIL import Image  # type: ignore
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+    Image = None  # type: ignore
 
-from telegram import ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.constants import ChatType, MessageEntityType, ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TelegramError
+try:
+    import pytesseract  # type: ignore
+    TESS_AVAILABLE = True
+except ImportError:
+    TESS_AVAILABLE = False
+    pytesseract = None  # type: ignore
+
+# PTB v20+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
+)
+from telegram.constants import ParseMode, ChatMemberStatus
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
-    ApplicationHandlerStop,
+    CommandHandler,
+    MessageHandler,
     CallbackQueryHandler,
     ChatMemberHandler,
-    CommandHandler,
     ContextTypes,
-    MessageHandler,
     filters,
 )
 
-try:
-    from PIL import Image, UnidentifiedImageError
-    import pytesseract
-
-    OCR_AVAILABLE = True
-except ImportError:  # The bot still runs; OCR simply degrades to a warning.
-    OCR_AVAILABLE = False
-    Image = None  # type: ignore[assignment]
-    UnidentifiedImageError = OSError  # type: ignore[assignment,misc]
-    pytesseract = None  # type: ignore[assignment]
-
-logger = logging.getLogger("miss_sona")
-
-DEFAULT_BANNED_WORDS = (
-    "porn", "xxx", "nsfw", "escort", "phishing", "airdrop-scam",
-    "nude", "casino-spam", "crypto-doubler", "free-giftcard",
+# ──────────────────────────────────────────
+# Logging
+# ──────────────────────────────────────────
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
+log = logging.getLogger("MissSona")
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# --------------------------------------------------------------------------- #
-# Configuration                                                               #
-# --------------------------------------------------------------------------- #
+# ──────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "PUT_YOUR_TOKEN_HERE")
+OWNER_ID: Optional[int] = int(os.getenv("OWNER_ID", "0")) or None
+DB_PATH: str = os.getenv("DB_PATH", "miss_sona.db")
 
-def _parse_ids(raw: str) -> set[int]:
-    return {int(x) for x in re.findall(r"-?\d+", raw or "")}
+WARN_LIMIT = 3
+CAPTCHA_TIMEOUT = 120  # seconds
+CAPTCHA_BAN_ON_FAIL = True
+TAG_BATCH_SIZE = 5
+TAG_BATCH_DELAY = 3.0
+ILLEGAL_NOTICE = "I found something illegal so I deleted it"
+ILLEGAL_NOTICE_TTL = 15  # seconds auto-delete notice
 
-
-def _parse_csv(raw: str) -> tuple[str, ...]:
-    return tuple(p.strip().lower() for p in (raw or "").split(",") if p.strip())
-
-
-def _env_int(key: str, default: int, low: int, high: int) -> int:
-    try:
-        return max(low, min(high, int(os.getenv(key, str(default)))))
-    except ValueError:
-        logger.warning("Invalid %s=%r; using %s", key, os.getenv(key), default)
-        return default
-
-
-def _env_float(key: str, default: float, low: float, high: float) -> float:
-    try:
-        return max(low, min(high, float(os.getenv(key, str(default)))))
-    except ValueError:
-        logger.warning("Invalid %s=%r; using %s", key, os.getenv(key), default)
-        return default
-
-
-@dataclass(frozen=True)
-class Config:
-    """Immutable runtime configuration loaded once from the environment."""
-
-    token: str
-    owner_ids: frozenset[int]
-    db_path: Path
-    warn_limit: int
-    content_ban_threshold: int
-    banned_words: tuple[str, ...]
-    allowed_domains: frozenset[str]
-    link_whitelist: frozenset[int]
-    captcha_timeout: int
-    broadcast_cooldown: int
-    mention_delay: float
-    mention_batch_size: int
-    max_mentions: int
-    active_window_days: int
-    max_guesses: int
-    ocr_lang: str
-    ocr_max_bytes: int
-    tesseract_cmd: str
-    error_chat_id: Optional[int]
-    words_file: Optional[Path]
-
-    @classmethod
-    def from_env(cls) -> "Config":
-        token = os.getenv("BOT_TOKEN", "").strip()
-        if not token or ":" not in token:
-            raise SystemExit("BOT_TOKEN is missing. Set it in .env (from @BotFather).")
-        raw_chat = os.getenv("ERROR_CHAT_ID", "").strip()
-        words_file = os.getenv("WORDS_FILE", "").strip()
-        return cls(
-            token=token,
-            owner_ids=frozenset(_parse_ids(os.getenv("OWNER_IDS", ""))),
-            db_path=Path(os.getenv("DB_PATH", "bot_data.db")).resolve(),
-            warn_limit=_env_int("WARN_LIMIT", 3, 1, 20),
-            content_ban_threshold=_env_int("CONTENT_BAN_THRESHOLD", 2, 1, 20),
-            banned_words=_parse_csv(os.getenv("BANNED_WORDS", ",".join(DEFAULT_BANNED_WORDS))),
-            allowed_domains=frozenset(_parse_csv(os.getenv("ALLOWED_DOMAINS", "github.com,stackoverflow.com"))),
-            link_whitelist=frozenset(_parse_ids(os.getenv("LINK_WHITELIST", ""))),
-            captcha_timeout=_env_int("CAPTCHA_TIMEOUT", 120, 30, 900),
-            broadcast_cooldown=_env_int("BROADCAST_COOLDOWN", 300, 10, 3600),
-            mention_delay=_env_float("MENTION_DELAY", 3.0, 1.0, 30.0),
-            mention_batch_size=_env_int("MENTION_BATCH_SIZE", 1, 1, 20),
-            max_mentions=_env_int("MAX_MENTIONS", 0, 0, 100000),  # 0 = mention everyone
-            active_window_days=_env_int("ACTIVE_WINDOW_DAYS", 30, 1, 3650),
-            max_guesses=_env_int("MAX_GUESSES", 30, 5, 60),
-            ocr_lang=os.getenv("OCR_LANG", "eng").strip() or "eng",
-            ocr_max_bytes=_env_int("OCR_MAX_BYTES", 8 * 1024 * 1024, 1024, 20 * 1024 * 1024),
-            tesseract_cmd=os.getenv("TESSERACT_CMD", "").strip(),
-            error_chat_id=int(raw_chat) if raw_chat.lstrip("-").isdigit() else None,
-            words_file=Path(words_file) if words_file else None,
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Word bank for the guessing game                                              #
-# --------------------------------------------------------------------------- #
-
-WORD_BANK: dict[int, tuple[str, ...]] = {
-    3: ("ace", "arc", "ash", "bee", "cat", "cub", "dog", "dot", "elm", "fog",
-        "gem", "ice", "ink", "joy", "key", "map", "oak", "owl", "pen", "pie",
-        "ray", "sun", "tea", "toy", "van", "web", "zip", "ant", "bus", "cup"),
-    4: ("atom", "blue", "calm", "dawn", "echo", "fire", "glow", "hero", "iris",
-        "jazz", "kite", "luna", "mint", "nova", "opal", "pine", "quiz", "rain",
-        "star", "tide", "unit", "vibe", "wave", "yarn", "zone", "bolt", "clay",
-        "dusk", "fern", "gold", "harp", "isle", "jade"),
-    5: ("amber", "blaze", "brave", "cloud", "crane", "delta", "eagle", "flame",
-        "glass", "grape", "haven", "ivory", "jelly", "knack", "lemon", "mango",
-        "nexus", "ocean", "pixel", "quilt", "raven", "scout", "tiger", "umber",
-        "vivid", "wheat", "xenon", "yacht", "zebra", "prism", "spark", "stone",
-        "swift", "tulip", "ultra", "vault", "waltz", "young", "zesty"),
-    6: ("astral", "banana", "canyon", "desert", "engine", "falcon", "garden",
-        "harbor", "island", "jungle", "kitten", "lagoon", "marble", "nectar",
-        "orange", "planet", "quiver", "rocket", "saddle", "temple", "unison",
-        "velvet", "walnut", "yellow", "zephyr", "breeze", "cobalt", "dragon",
-        "forest", "meadow", "pebble", "ripple", "sunset", "willow", "cactus",
-        "pickle", "puzzle", "silver", "violet", "wonder", "anchor", "bubble",
-        "carpet"),
-    7: ("galaxy", "harmony", "journey", "lantern", "mystery", "crystal",
-        "compass", "diamond", "eclipse", "freedom", "granite", "horizon",
-        "islands", "kitchen", "library", "machine", "natural", "oceanic",
-        "panther", "quality", "rainbow", "sunrise", "village", "whisper"),
-    8: ("adventure", "bluebird", "campfire", "daylight", "elephant", "firework",
-        "gardener", "mountain", "notebook", "overture", "paintbox", "sandwich",
-        "umbrella", "sunlight", "treasure", "keyboard", "portrait", "festival",
-        "midnight"),
+# Default chat protection toggles
+DEFAULT_SETTINGS = {
+    "antilink": 1,
+    "antispam": 1,
+    "ocr_protection": 1,
+    "captcha_enabled": 1,
 }
 
+# ──────────────────────────────────────────
+# Word Lists — Wordle / Jumble
+# ──────────────────────────────────────────
+WORD_BANK = {
+    4: [
+        "code","game","sona","rose","bolt","flux","kilo","nova","apex","zeal",
+        "iris","luna","aura","vibe","echo","frost","glow","kind","mint","nest",
+        "opal","peak","quip","rift","sage","tide","vale","warp","yarn","zest",
+        "bark","clap","dune","fern","gale","howl","jade","kite","lark","moss",
+        "neon","oath","plum","quay","rust","star","tune","urge","void","wisp",
+    ],
+    5: [
+        "sonar","crane","ultra","blitz","frost","flame","glide","prism","quirk","amber",
+        "blaze","crest","drift","ember","forge","gloom","haven","ivory","jolly","kneel",
+        "lunar","mango","nymph","ocean","pride","quest","rally","stone","theta","unity",
+        "vivid","whirl","xenon","yield","zebra","apple","brave","crown","dream","eager",
+        "flora","giant","happy","ideal","jazzy","knack","light","magic","noble","olive",
+    ],
+    6: [
+        "sonaai","python","rocket","silver","golden","cobalt","nebula","jasper","quartz","velvet",
+        "arcade","breeze","castle","desert","engine","falcon","galaxy","harbor","island","jungle",
+        "kernel","legend","marble","nimbus","orange","planet","quiver","ranger","summit","tunnel",
+        "unique","voyage","wisdom","yonder","zenith","bronze","crystal","diamond","emerald","fortune",
+        "guitar","horizon","imagine","journey","kingdom","lantern","midnight","natural","outlook","parrot",
+    ],
+}
 
-def load_word_bank(custom: Optional[Path]) -> dict[int, tuple[str, ...]]:
-    """Optionally replace/extend the built-in bank with a JSON file.
+# Fallback illegal/prohibited patterns for OCR + text scans
+# Includes ToS-violating + placeholder illegal categories. Extend as needed.
+OCR_BLACKLIST = [
+    "csam", "child porn", "cp video", "minor nude", "bomb making", "how to make bomb",
+    "terrorist recruitment", "kill all", "illegal drugs buy", "credit card dump",
+]
+# URL / malicious patterns
+LINK_RE = re.compile(r"(?:https?://|t\.me/|telegram\.me/|telegram\.dog/|wa\.me/|discord\.gg/)\S+", re.I)
+SPAM_RE = re.compile(r"(.)\1{7,}|(.)(\1.{0,2}){6,}", re.I)  # repeated chars / flood
 
-    Accepted formats: {"4": ["word", ...], "5": [...]} or ["word", ...].
-    """
-    bank = {length: tuple(words) for length, words in WORD_BANK.items()}
-    if not custom:
-        return bank
-    try:
-        data = json.loads(Path(custom).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        logger.warning("Could not read WORDS_FILE %s: %s", custom, exc)
-        return bank
-    raw_items: Iterable[tuple[Any, Any]]
-    raw_items = data.items() if isinstance(data, dict) else ((None, w) for w in data)
-    for key, value in raw_items:
-        if not isinstance(value, (list, tuple)):
-            continue
-        cleaned = tuple(str(w).strip().lower() for w in value if isinstance(w, str) and w.isalpha())
-        if key is None:  # flat list: infer lengths
-            for word in cleaned:
-                bank.setdefault(len(word), ())
-                bank[len(word)] = bank[len(word)] + (word,)
-        elif str(key).isdigit() and cleaned:
-            bank[int(key)] = cleaned
-    return {k: v for k, v in bank.items() if v}
+# In-memory game state is also persisted to DB; this mirrors for quick access
+# pending captcha: {(chat_id, user_id): job}
+pending_captcha: dict[Tuple[int, int], object] = {}
 
-
-# --------------------------------------------------------------------------- #
-# Text normalisation and keyword matching                                      #
-# --------------------------------------------------------------------------- #
-
-_ZERO_WIDTH = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff"), None)
-_CONFUSABLES = str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s",
-                              "7": "t", "@": "a", "$": "s", "!": "i"})
-
-
-def normalize(text: str) -> str:
-    """NFKC + confusable folding so 'p0rn' and 'p o r n' are still detectable."""
-    text = unicodedata.normalize("NFKC", text or "").translate(_ZERO_WIDTH)
-    text = text.translate(_CONFUSABLES).casefold()
-    text = re.sub(r"[^\w\s]+", " ", text)
-    return " ".join(text.split())
-
-
-class KeywordMatcher:
-    """Word-boundary matcher over normalised text (safe for multi-word terms)."""
-
-    def __init__(self, words: Iterable[str]) -> None:
-        self.patterns: list[tuple[str, re.Pattern[str]]] = []
-        for raw in words:
-            needle = normalize(raw)
-            if needle:
-                self.patterns.append(
-                    (raw, re.compile(r"(?<!\w)" + re.escape(needle) + r"(?!\w)", re.IGNORECASE))
-                )
-
-    def find(self, text: str) -> Optional[str]:
-        if not text or not self.patterns:
-            return None
-        haystack = normalize(text)
-        for raw, pattern in self.patterns:
-            if pattern.search(haystack):
-                return raw
-        return None
-
-
-# --------------------------------------------------------------------------- #
-# SQLite persistence                                                          #
-# --------------------------------------------------------------------------- #
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS rules (
-    chat_id     INTEGER PRIMARY KEY,
-    text        TEXT NOT NULL,
-    updated_by  INTEGER NOT NULL,
-    updated_at  REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS notes (
-    chat_id     INTEGER NOT NULL,
-    name        TEXT NOT NULL,
-    text        TEXT NOT NULL,
-    updated_by  INTEGER NOT NULL,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (chat_id, name)
-);
-CREATE TABLE IF NOT EXISTS warnings (
-    chat_id     INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
-    count       INTEGER NOT NULL DEFAULT 0,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS content_strikes (
-    chat_id     INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
-    count       INTEGER NOT NULL DEFAULT 0,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS link_trust (
-    chat_id     INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
-    granted_by  INTEGER NOT NULL,
-    created_at  REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS activity (
-    chat_id     INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
-    name        TEXT NOT NULL DEFAULT '',
-    username    TEXT NOT NULL DEFAULT '',
-    is_bot      INTEGER NOT NULL DEFAULT 0,
-    last_seen   REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS captcha (
-    chat_id       INTEGER NOT NULL,
-    user_id       INTEGER NOT NULL,
-    token         TEXT NOT NULL,
-    message_id    INTEGER NOT NULL,
-    display_name  TEXT NOT NULL DEFAULT '',
-    created_at    REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS games (
-    chat_id     INTEGER PRIMARY KEY,
-    word        TEXT NOT NULL,
-    length      INTEGER NOT NULL,
-    guesses     TEXT NOT NULL DEFAULT '[]',
-    started_by  INTEGER NOT NULL,
-    started_at  REAL NOT NULL,
-    status      TEXT NOT NULL DEFAULT 'active'
-);
-CREATE TABLE IF NOT EXISTS wins (
-    chat_id     INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
-    name        TEXT NOT NULL DEFAULT '',
-    wins        INTEGER NOT NULL DEFAULT 0,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE TABLE IF NOT EXISTS greetings (
-    chat_id     INTEGER NOT NULL,
-    kind        TEXT NOT NULL,              -- 'welcome' or 'goodbye'
-    text        TEXT,                       -- NULL = use the built-in default
-    photo_id    TEXT,                       -- optional Telegram file_id
-    enabled     INTEGER NOT NULL DEFAULT 1,
-    updated_by  INTEGER NOT NULL,
-    updated_at  REAL NOT NULL,
-    PRIMARY KEY (chat_id, kind)
-);
-CREATE TABLE IF NOT EXISTS connections (
-    user_id       INTEGER PRIMARY KEY,      -- one connected group per admin
-    chat_id       INTEGER NOT NULL,
-    title         TEXT NOT NULL DEFAULT '',
-    connected_at  REAL NOT NULL
-);
-CREATE TABLE IF NOT EXISTS bans (
-    chat_id     INTEGER NOT NULL,
-    user_id     INTEGER NOT NULL,
-    name        TEXT NOT NULL DEFAULT '',
-    reason      TEXT NOT NULL DEFAULT '',
-    banned_by   INTEGER NOT NULL DEFAULT 0,
-    banned_at   REAL NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-);
-CREATE INDEX IF NOT EXISTS idx_activity_seen ON activity (chat_id, last_seen DESC);
-CREATE INDEX IF NOT EXISTS idx_wins_chat ON wins (chat_id, wins DESC);
-"""
-
-
+# ──────────────────────────────────────────
+# SQLite Persistence Layer — thread-safe via asyncio.to_thread + WAL
+# ──────────────────────────────────────────
 class Database:
-    """Small synchronous SQLite facade; every method is called off-loop."""
-
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: str):
         self.path = path
-        self._lock = threading.RLock()
-        self._conn: Optional[sqlite3.Connection] = None
+        self._init_lock = asyncio.Lock()
 
-    # -- infrastructure -----------------------------------------------------
-    async def run(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """Execute a sync DB method in the default thread pool."""
-        return await asyncio.to_thread(fn, *args, **kwargs)
-
+    # low-level sync helpers — always run in thread
     def _connect(self) -> sqlite3.Connection:
-        with self._lock:
-            if self._conn is None:
-                self.path.parent.mkdir(parents=True, exist_ok=True)
-                conn = sqlite3.connect(str(self.path), check_same_thread=False, timeout=10)
-                conn.row_factory = sqlite3.Row
-                conn.execute("PRAGMA journal_mode=WAL")
-                conn.execute("PRAGMA synchronous=NORMAL")
-                conn.execute("PRAGMA busy_timeout=5000")
-                conn.execute("PRAGMA foreign_keys=ON")
-                self._conn = conn
-            return self._conn
+        con = sqlite3.connect(self.path, timeout=30, check_same_thread=False, isolation_level=None)
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+        con.execute("PRAGMA foreign_keys=ON;")
+        con.execute("PRAGMA busy_timeout=10000;")
+        return con
 
-    def _query(self, sql: str, params: tuple = (), fetch: Optional[str] = None) -> Any:
-        with self._lock:
-            conn = self._connect()
-            cursor = conn.execute(sql, params)
-            if fetch == "one":
-                row = cursor.fetchone()
-                result = dict(row) if row else None
-            elif fetch == "all":
-                result = [dict(row) for row in cursor.fetchall()]
-            else:
-                result = None
-            conn.commit()
-            return result
+    def _init_sync(self):
+        con = self._connect()
+        cur = con.cursor()
+        # Warnings — composite PK (chat_id, user_id)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS warnings(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            count INTEGER NOT NULL DEFAULT 0,
+            last_reason TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(chat_id, user_id)
+        );""")
+        # Rules — one per chat
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS rules(
+            chat_id INTEGER PRIMARY KEY,
+            content TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );""")
+        # Notes — composite PK (chat_id, name)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS notes(
+            chat_id INTEGER NOT NULL,
+            name TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_by INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(chat_id, name)
+        );""")
+        # Trusted users — composite PK
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS trusted(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            added_by INTEGER,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(chat_id, user_id)
+        );""")
+        # Global banned-word vault — shared across all groups
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS global_banned_words(
+            word TEXT PRIMARY KEY COLLATE NOCASE,
+            added_by INTEGER,
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );""")
+        # Chat settings — granular locks
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS chat_settings(
+            chat_id INTEGER PRIMARY KEY,
+            antilink INTEGER DEFAULT 1,
+            antispam INTEGER DEFAULT 1,
+            ocr_protection INTEGER DEFAULT 1,
+            captcha_enabled INTEGER DEFAULT 1
+        );""")
+        # Active user pool
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS active_users(
+            chat_id INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            username TEXT,
+            fullname TEXT,
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(chat_id, user_id)
+        );""")
+        # Wordle active game per chat
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS games(
+            chat_id INTEGER PRIMARY KEY,
+            word TEXT NOT NULL,
+            length INTEGER NOT NULL,
+            starter_id INTEGER,
+            attempts INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );""")
+        # Leaderboard — career wins
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS leaderboard(
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            wins INTEGER DEFAULT 0,
+            games_played INTEGER DEFAULT 0
+        );""")
+        con.commit()
+        con.close()
 
-    def init_schema(self) -> None:
-        with self._lock:
-            conn = self._connect()
-            conn.executescript(SCHEMA_SQL)
-            conn.commit()
-        logger.info("SQLite schema ready at %s", self.path)
+    async def init(self):
+        async with self._init_lock:
+            await asyncio.to_thread(self._init_sync)
+        log.info("SQLite initialized at %s (WAL mode)", self.path)
 
-    def close(self) -> None:
-        with self._lock:
-            if self._conn is not None:
-                self._conn.close()
-                self._conn = None
-
-    # -- rules and notes ----------------------------------------------------
-    def set_rules(self, chat_id: int, text: str, updated_by: int) -> None:
-        self._query(
-            "INSERT INTO rules (chat_id, text, updated_by, updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(chat_id) DO UPDATE SET text=excluded.text, "
-            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
-            (chat_id, text, updated_by, time.time()),
-        )
-
-    def get_rules(self, chat_id: int) -> Optional[dict]:
-        return self._query("SELECT text, updated_by, updated_at FROM rules WHERE chat_id=?",
-                           (chat_id,), fetch="one")
-
-    def set_note(self, chat_id: int, name: str, text: str, updated_by: int) -> None:
-        self._query(
-            "INSERT INTO notes (chat_id, name, text, updated_by, updated_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(chat_id, name) DO UPDATE SET text=excluded.text, "
-            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
-            (chat_id, name, text, updated_by, time.time()),
-        )
-
-    def get_note(self, chat_id: int, name: str) -> Optional[dict]:
-        return self._query("SELECT text, updated_by FROM notes WHERE chat_id=? AND name=?",
-                           (chat_id, name), fetch="one")
-
-    def list_notes(self, chat_id: int) -> list[dict]:
-        return self._query("SELECT name FROM notes WHERE chat_id=? ORDER BY name",
-                           (chat_id,), fetch="all") or []
-
-    def delete_note(self, chat_id: int, name: str) -> bool:
-        with self._lock:
-            conn = self._connect()
-            cursor = conn.execute("DELETE FROM notes WHERE chat_id=? AND name=?", (chat_id, name))
-            conn.commit()
-            return cursor.rowcount > 0
-
-    # -- strikes ------------------------------------------------------------
-    def add_warn(self, chat_id: int, user_id: int) -> int:
-        return self._bump("warnings", chat_id, user_id)
-
-    def get_warns(self, chat_id: int, user_id: int) -> int:
-        row = self._query("SELECT count FROM warnings WHERE chat_id=? AND user_id=?",
-                          (chat_id, user_id), fetch="one")
-        return int(row["count"]) if row else 0
-
-    def reset_warns(self, chat_id: int, user_id: int) -> None:
-        self._query("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-
-    def add_content_strike(self, chat_id: int, user_id: int) -> int:
-        return self._bump("content_strikes", chat_id, user_id)
-
-    def get_content_strikes(self, chat_id: int, user_id: int) -> int:
-        row = self._query("SELECT count FROM content_strikes WHERE chat_id=? AND user_id=?",
-                          (chat_id, user_id), fetch="one")
-        return int(row["count"]) if row else 0
-
-    def reset_content_strikes(self, chat_id: int, user_id: int) -> None:
-        self._query("DELETE FROM content_strikes WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-
-    def _bump(self, table: str, chat_id: int, user_id: int) -> int:
-        # table is a hard-coded internal constant, never user input.
-        with self._lock:
-            conn = self._connect()
-            row = conn.execute(
-                f"SELECT count FROM {table} WHERE chat_id=? AND user_id=?", (chat_id, user_id)
-            ).fetchone()
-            count = int(row["count"] if row else 0) + 1
-            conn.execute(
-                f"INSERT INTO {table} (chat_id, user_id, count, updated_at) VALUES (?, ?, ?, ?) "
-                "ON CONFLICT(chat_id, user_id) DO UPDATE SET count=excluded.count, "
-                "updated_at=excluded.updated_at",
-                (chat_id, user_id, count, time.time()),
-            )
-            conn.commit()
-            return count
-
-    # -- link trust ---------------------------------------------------------
-    def set_link_trust(self, chat_id: int, user_id: int, granted_by: int) -> None:
-        self._query(
-            "INSERT OR REPLACE INTO link_trust (chat_id, user_id, granted_by, created_at) "
-            "VALUES (?, ?, ?, ?)", (chat_id, user_id, granted_by, time.time()),
-        )
-
-    def remove_link_trust(self, chat_id: int, user_id: int) -> None:
-        self._query("DELETE FROM link_trust WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-
-    def is_link_trusted(self, chat_id: int, user_id: int) -> bool:
-        return self._query("SELECT 1 FROM link_trust WHERE chat_id=? AND user_id=?",
-                           (chat_id, user_id), fetch="one") is not None
-
-    # -- activity -----------------------------------------------------------
-    def touch_activity(self, chat_id: int, user: Any) -> None:
-        self._query(
-            "INSERT INTO activity (chat_id, user_id, name, username, is_bot, last_seen) "
-            "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(chat_id, user_id) DO UPDATE SET "
-            "name=excluded.name, username=excluded.username, is_bot=excluded.is_bot, "
-            "last_seen=excluded.last_seen",
-            (chat_id, user.id, getattr(user, "full_name", "") or "",
-             (getattr(user, "username", "") or "").lower(),
-             int(bool(getattr(user, "is_bot", False))), time.time()),
-        )
-
-    def active_members(self, chat_id: int, since: float, limit: int) -> list[dict]:
-        return self._query(
-            "SELECT user_id, name, username FROM activity "
-            "WHERE chat_id=? AND last_seen>=? AND is_bot=0 AND user_id>0 "
-            "ORDER BY last_seen DESC LIMIT ?", (chat_id, since, limit), fetch="all",
-        ) or []
-
-    def find_by_username(self, chat_id: int, username: str) -> Optional[dict]:
-        return self._query(
-            "SELECT user_id, name FROM activity WHERE chat_id=? AND lower(username)=? LIMIT 1",
-            (chat_id, username.lstrip("@").lower()), fetch="one",
-        )
-
-    # -- captcha ------------------------------------------------------------
-    def save_captcha(self, chat_id: int, user_id: int, token: str,
-                     message_id: int, display_name: str) -> None:
-        self._query(
-            "INSERT OR REPLACE INTO captcha "
-            "(chat_id, user_id, token, message_id, display_name, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, token, message_id, display_name, time.time()),
-        )
-
-    def get_captcha(self, chat_id: int, user_id: int) -> Optional[dict]:
-        return self._query("SELECT * FROM captcha WHERE chat_id=? AND user_id=?",
-                           (chat_id, user_id), fetch="one")
-
-    def finish_captcha(self, chat_id: int, user_id: int) -> None:
-        self._query("DELETE FROM captcha WHERE chat_id=? AND user_id=?", (chat_id, user_id))
-
-    def pending_captchas(self) -> list[dict]:
-        return self._query("SELECT * FROM captcha", fetch="all") or []
-
-    # -- games --------------------------------------------------------------
-    def get_game(self, chat_id: int) -> Optional[dict]:
-        return self._query("SELECT * FROM games WHERE chat_id=?", (chat_id,), fetch="one")
-
-    def start_game(self, chat_id: int, word: str, length: int, started_by: int) -> None:
-        self._query(
-            "INSERT INTO games (chat_id, word, length, guesses, started_by, started_at, status) "
-            "VALUES (?, ?, ?, '[]', ?, ?, 'active') ON CONFLICT(chat_id) DO UPDATE SET "
-            "word=excluded.word, length=excluded.length, guesses='[]', "
-            "started_by=excluded.started_by, started_at=excluded.started_at, status='active'",
-            (chat_id, word, length, started_by, time.time()),
-        )
-
-    def append_guess(self, chat_id: int, entry: dict) -> Optional[int]:
-        """Atomically add one guess; returns the new total or None if no game."""
-        with self._lock:
-            conn = self._connect()
-            row = conn.execute("SELECT guesses, status FROM games WHERE chat_id=?",
-                               (chat_id,)).fetchone()
-            if row is None or row["status"] != "active":
-                return None
+    # ——— generic helpers ———
+    async def _exec(self, sql: str, params: tuple = (), fetch: str = "none"):
+        def _run():
+            con = self._connect()
             try:
-                guesses = json.loads(row["guesses"])
-            except (TypeError, ValueError):
-                guesses = []
-            guesses.append(entry)
-            conn.execute("UPDATE games SET guesses=? WHERE chat_id=?",
-                         (json.dumps(guesses, ensure_ascii=False), chat_id))
-            conn.commit()
-            return len(guesses)
+                cur = con.cursor()
+                cur.execute(sql, params)
+                if fetch == "one":
+                    row = cur.fetchone()
+                    con.commit()
+                    return row
+                elif fetch == "all":
+                    rows = cur.fetchall()
+                    con.commit()
+                    return rows
+                elif fetch == "scalar":
+                    row = cur.fetchone()
+                    con.commit()
+                    return row[0] if row else None
+                con.commit()
+                return cur.rowcount
+            finally:
+                con.close()
+        return await asyncio.to_thread(_run)
 
-    def finish_game(self, chat_id: int, status: str = "finished") -> None:
-        self._query("UPDATE games SET status=? WHERE chat_id=?", (status, chat_id))
+    async def _exec_many(self, sql: str, seq):
+        def _run():
+            con = self._connect()
+            try:
+                cur = con.cursor()
+                cur.executemany(sql, seq)
+                con.commit()
+                return cur.rowcount
+            finally:
+                con.close()
+        return await asyncio.to_thread(_run)
 
-    def record_win(self, chat_id: int, user_id: int, name: str) -> int:
-        with self._lock:
-            conn = self._connect()
-            row = conn.execute("SELECT wins FROM wins WHERE chat_id=? AND user_id=?",
-                               (chat_id, user_id)).fetchone()
-            total = int(row["wins"] if row else 0) + 1
-            conn.execute(
-                "INSERT INTO wins (chat_id, user_id, name, wins, updated_at) VALUES (?, ?, ?, ?, ?) "
-                "ON CONFLICT(chat_id, user_id) DO UPDATE SET name=excluded.name, "
-                "wins=excluded.wins, updated_at=excluded.updated_at",
-                (chat_id, user_id, name, total, time.time()),
-            )
-            conn.commit()
-            return total
+    # ─ warnings ─
+    async def add_warn(self, chat_id: int, user_id: int, reason: str = "") -> int:
+        def _run():
+            con = self._connect()
+            try:
+                cur = con.cursor()
+                cur.execute("INSERT OR IGNORE INTO warnings(chat_id, user_id, count) VALUES(?,?,0)", (chat_id, user_id))
+                cur.execute("UPDATE warnings SET count = count + 1, last_reason=?, updated_at=CURRENT_TIMESTAMP WHERE chat_id=? AND user_id=?",
+                            (reason, chat_id, user_id))
+                cur.execute("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+                row = cur.fetchone()
+                con.commit()
+                return row[0] if row else 0
+            finally:
+                con.close()
+        return await asyncio.to_thread(_run)
 
-    def leaderboard(self, chat_id: int, limit: int = 5) -> list[dict]:
-        return self._query("SELECT user_id, name, wins FROM wins WHERE chat_id=? "
-                           "ORDER BY wins DESC LIMIT ?", (chat_id, limit), fetch="all") or []
+    async def get_warns(self, chat_id: int, user_id: int) -> int:
+        row = await self._exec("SELECT count FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id), fetch="one")
+        return row[0] if row else 0
 
-    # -- member roster (used by @all / /mentionall) -------------------------
-    def all_members(self, chat_id: int, limit: int = 0) -> list[dict]:
-        """Every known human member, active or not. limit=0 means no cap."""
-        return self._query(
-            "SELECT user_id, name, username FROM activity "
-            "WHERE chat_id=? AND is_bot=0 AND user_id>0 AND user_id!=777000 "
-            "ORDER BY name COLLATE NOCASE LIMIT ?",
-            (chat_id, limit if limit > 0 else -1), fetch="all",
-        ) or []
+    async def reset_warns(self, chat_id: int, user_id: int):
+        await self._exec("DELETE FROM warnings WHERE chat_id=? AND user_id=?", (chat_id, user_id))
 
-    def remove_member(self, chat_id: int, user_id: int) -> None:
-        self._query("DELETE FROM activity WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    # ─ rules ─
+    async def set_rules(self, chat_id: int, content: str):
+        await self._exec("INSERT INTO rules(chat_id, content) VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET content=excluded.content, updated_at=CURRENT_TIMESTAMP", (chat_id, content))
 
-    # -- welcome / goodbye messages -----------------------------------------
-    def set_greeting(self, chat_id: int, kind: str, text: Optional[str],
-                     photo_id: Optional[str], updated_by: int) -> None:
-        self._query(
-            "INSERT INTO greetings (chat_id, kind, text, photo_id, enabled, updated_by, updated_at) "
-            "VALUES (?, ?, ?, ?, 1, ?, ?) ON CONFLICT(chat_id, kind) DO UPDATE SET "
-            "text=excluded.text, photo_id=excluded.photo_id, enabled=1, "
-            "updated_by=excluded.updated_by, updated_at=excluded.updated_at",
-            (chat_id, kind, text, photo_id, updated_by, time.time()),
-        )
+    async def get_rules(self, chat_id: int) -> Optional[str]:
+        row = await self._exec("SELECT content FROM rules WHERE chat_id=?", (chat_id,), fetch="one")
+        return row[0] if row else None
 
-    def set_greeting_enabled(self, chat_id: int, kind: str, enabled: bool, updated_by: int) -> None:
-        self._query(
-            "INSERT INTO greetings (chat_id, kind, enabled, updated_by, updated_at) "
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id, kind) DO UPDATE SET "
-            "enabled=excluded.enabled, updated_by=excluded.updated_by, "
-            "updated_at=excluded.updated_at",
-            (chat_id, kind, int(enabled), updated_by, time.time()),
-        )
+    # ─ notes ─
+    async def set_note(self, chat_id: int, name: str, content: str, created_by: int):
+        await self._exec("INSERT INTO notes(chat_id, name, content, created_by) VALUES(?,?,?,?) ON CONFLICT(chat_id, name) DO UPDATE SET content=excluded.content, created_by=excluded.created_by, created_at=CURRENT_TIMESTAMP",
+                         (chat_id, name.lower(), content, created_by))
 
-    def get_greeting(self, chat_id: int, kind: str) -> Optional[dict]:
-        return self._query("SELECT text, photo_id, enabled FROM greetings "
-                           "WHERE chat_id=? AND kind=?", (chat_id, kind), fetch="one")
+    async def get_note(self, chat_id: int, name: str) -> Optional[str]:
+        row = await self._exec("SELECT content FROM notes WHERE chat_id=? AND name=?", (chat_id, name.lower()), fetch="one")
+        return row[0] if row else None
 
-    def delete_greeting(self, chat_id: int, kind: str) -> bool:
-        """Drop the custom text/photo; the on/off switch is kept."""
-        with self._lock:
-            conn = self._connect()
-            cursor = conn.execute(
-                "UPDATE greetings SET text=NULL, photo_id=NULL WHERE chat_id=? AND kind=? "
-                "AND (text IS NOT NULL OR photo_id IS NOT NULL)", (chat_id, kind))
-            conn.commit()
-            return cursor.rowcount > 0
+    async def del_note(self, chat_id: int, name: str) -> int:
+        return await self._exec("DELETE FROM notes WHERE chat_id=? AND name=?", (chat_id, name.lower()))
 
-    # -- private-chat connections (/connect) --------------------------------
-    def set_connection(self, user_id: int, chat_id: int, title: str) -> None:
-        self._query("INSERT OR REPLACE INTO connections (user_id, chat_id, title, connected_at) "
-                    "VALUES (?, ?, ?, ?)", (user_id, chat_id, title, time.time()))
+    async def list_notes(self, chat_id: int) -> List[str]:
+        rows = await self._exec("SELECT name FROM notes WHERE chat_id=? ORDER BY name", (chat_id,), fetch="all")
+        return [r[0] for r in (rows or [])]
 
-    def get_connection(self, user_id: int) -> Optional[dict]:
-        return self._query("SELECT chat_id, title FROM connections WHERE user_id=?",
-                           (user_id,), fetch="one")
+    # ─ trusted ─
+    async def trust(self, chat_id: int, user_id: int, added_by: int):
+        await self._exec("INSERT OR IGNORE INTO trusted(chat_id, user_id, added_by) VALUES(?,?,?)", (chat_id, user_id, added_by))
 
-    def clear_connection(self, user_id: int) -> None:
-        self._query("DELETE FROM connections WHERE user_id=?", (user_id,))
+    async def untrust(self, chat_id: int, user_id: int):
+        await self._exec("DELETE FROM trusted WHERE chat_id=? AND user_id=?", (chat_id, user_id))
 
-    # -- ban list (/banned) -------------------------------------------------
-    def add_ban(self, chat_id: int, user_id: int, name: str, reason: str,
-                banned_by: int, overwrite: bool = True) -> None:
-        """overwrite=False keeps a reason that a command already stored."""
-        verb = "INSERT OR REPLACE" if overwrite else "INSERT OR IGNORE"
-        self._query(
-            f"{verb} INTO bans (chat_id, user_id, name, reason, banned_by, banned_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (chat_id, user_id, name, reason, banned_by, time.time()),
-        )
-        self.remove_member(chat_id, user_id)  # banned users are never mentioned
+    async def is_trusted(self, chat_id: int, user_id: int) -> bool:
+        row = await self._exec("SELECT 1 FROM trusted WHERE chat_id=? AND user_id=?", (chat_id, user_id), fetch="one")
+        return bool(row)
 
-    def remove_ban(self, chat_id: int, user_id: int) -> None:
-        self._query("DELETE FROM bans WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+    # ─ global banned words ─
+    async def add_global_word(self, word: str, added_by: int):
+        await self._exec("INSERT OR IGNORE INTO global_banned_words(word, added_by) VALUES(?,?)", (word.lower().strip(), added_by))
 
-    def list_bans(self, chat_id: int, limit: int = 50) -> list[dict]:
-        return self._query(
-            "SELECT user_id, name, reason, banned_by, banned_at FROM bans "
-            "WHERE chat_id=? ORDER BY banned_at DESC LIMIT ?", (chat_id, limit), fetch="all",
-        ) or []
+    async def remove_global_word(self, word: str) -> int:
+        return await self._exec("DELETE FROM global_banned_words WHERE word=?", (word.lower().strip(),))
 
-    def dashboard(self, chat_id: int) -> dict:
-        def count(table: str) -> int:
-            row = self._query(f"SELECT COUNT(*) AS n FROM {table} WHERE chat_id=?",
-                              (chat_id,), fetch="one")
-            return int(row["n"]) if row else 0
-        return {"notes": count("notes"), "warned": count("warnings"),
-                "strikes": count("content_strikes"), "trusted": count("link_trust"),
-                "active": count("activity")}
+    async def list_global_words(self) -> List[str]:
+        rows = await self._exec("SELECT word FROM global_banned_words ORDER BY word", fetch="all")
+        return [r[0] for r in (rows or [])]
 
+    async def is_global_banned(self, text: str) -> Optional[str]:
+        """Return matched banned word if any, else None. Case-insensitive substring scan."""
+        words = await self.list_global_words()
+        low = text.lower()
+        for w in words:
+            if w and w.lower() in low:
+                return w
+        return None
 
-# --------------------------------------------------------------------------- #
-# Shared helpers                                                               #
-# --------------------------------------------------------------------------- #
-
-GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
-# Raw Bot API member statuses. Plain strings are used on purpose: the enum
-# member names differ between library versions (CREATOR vs OWNER, KICKED vs
-# BANNED), while these values are fixed by Telegram itself.
-ST_OWNER, ST_ADMIN, ST_MEMBER = "creator", "administrator", "member"
-ST_RESTRICTED, ST_LEFT, ST_BANNED = "restricted", "left", "kicked"
-BACKGROUND_TASKS: set[asyncio.Task] = set()
-_ADMIN_CACHE: dict[tuple[int, int], tuple[bool, float]] = {}
-BROADCAST_LAST: dict[int, float] = {}
-BROADCAST_LOCKS: dict[int, asyncio.Lock] = {}
-BROADCAST_CANCEL: dict[int, asyncio.Event] = {}  # chat_id -> "stop now" flag set by /cancel
-SHADOW_LAST: dict[int, float] = {}
-
-LINK_RE = re.compile(
-    r"(?i)(?:https?://\S+|www\.\S+|(?:t\.me|telegram\.me|tg\.me)/[^\s]+|tg://\S+)"
-)
-BROADCAST_RE = re.compile(
-    r"^(?:@(all|admin)|/(?:mentionall|tagall|all)(?:@\w+)?)\b(?:\s+([\s\S]+))?$", re.IGNORECASE
-)
-CAPTCHA_RE = re.compile(r"^cv:(-?\d+):(\d+):([A-Za-z0-9_\-]+)$")
-DURATION_RE = re.compile(r"^(\d+)\s*([smhd])$", re.IGNORECASE)
-NOTE_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]{1,32}$")
-
-
-def esc(value: Any) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def mention(user_id: int, name: str) -> str:
-    """Telegram HTML mention - works for users without a username."""
-    return f'<a href="tg://user?id={int(user_id)}">{esc(name or user_id)}</a>'
-
-
-def state(context: ContextTypes.DEFAULT_TYPE) -> tuple[Config, Database]:
-    data = context.application.bot_data
-    return data["cfg"], data["db"]
-
-
-def bot_of(context: ContextTypes.DEFAULT_TYPE):
-    # Prefer application.bot: context.bot is deprecated in newer PTB releases.
-    return context.application.bot
-
-
-def command_payload(message: Any) -> str:
-    """Everything after the first whitespace token of a command message."""
-    parts = (message.text or message.caption or "").split(None, 1)
-    return parts[1].strip() if len(parts) > 1 else ""
-
-
-def spawn(coro, application: Optional[Application] = None) -> asyncio.Task:
-    """Fire-and-forget with a strong reference and optional PTB task tracking."""
-    try:
-        task = application.create_task(coro) if application else asyncio.create_task(coro)
-    except (AttributeError, RuntimeError):
-        task = asyncio.create_task(coro)
-    BACKGROUND_TASKS.add(task)
-    task.add_done_callback(BACKGROUND_TASKS.discard)
-    return task
-
-
-async def safe_delete(bot, chat_id: int, message_id: int) -> bool:
-    try:
-        return bool(await bot.delete_message(chat_id=chat_id, message_id=message_id))
-    except TelegramError as exc:
-        logger.debug("Could not delete %s/%s: %s", chat_id, message_id, exc)
-        return False
-
-
-async def delete_later(bot, chat_id: int, message_id: int, delay: float = 8.0) -> None:
-    """Send-and-forget temporary notices (used by link/content warnings)."""
-    try:
-        await asyncio.sleep(delay)
-        await bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except TelegramError:
-        pass  # Message already removed, or bot lost delete rights.
-
-
-async def send_long(bot, chat_id: int, text: str, **kwargs: Any) -> None:
-    """Telegram caps messages at 4096 chars; split on line boundaries."""
-    kwargs.setdefault("parse_mode", ParseMode.HTML)
-    chunks: list[str] = []
-    current = ""
-    for line in text.splitlines(keepends=True) or [""]:
-        while len(line) > 3900:
-            if current:
-                chunks.append(current)
-                current = ""
-            chunks.append(line[:3900])
-            line = line[3900:]
-        if len(current) + len(line) > 3900:
-            chunks.append(current)
-            current = ""
-        current += line
-    if current.strip():
-        chunks.append(current)
-    for chunk in chunks or ["(empty)"]:
-        await bot.send_message(chat_id=chat_id, text=chunk, **kwargs)
-
-
-async def is_admin(bot, chat_id: int, user_id: int, ttl: float = 45.0) -> bool:
-    """Cached admin check to avoid a getChatMember call on every message."""
-    key = (chat_id, user_id)
-    cached = _ADMIN_CACHE.get(key)
-    if cached and time.monotonic() - cached[1] < ttl:
-        return cached[0]
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        allowed = member.status in (ST_ADMIN, ST_OWNER)
-    except TelegramError as exc:
-        logger.debug("Admin lookup failed for %s in %s: %s", user_id, chat_id, exc)
-        return False
-    if len(_ADMIN_CACHE) > 2000:
-        _ADMIN_CACHE.clear()
-    _ADMIN_CACHE[key] = (allowed, time.monotonic())
-    return allowed
-
-
-async def is_privileged(bot, chat_id: int, user_id: int, cfg: Config) -> bool:
-    return user_id in cfg.owner_ids or await is_admin(bot, chat_id, user_id)
-
-
-async def default_permissions(bot, chat_id: int) -> ChatPermissions:
-    """Unmute to the CHAT'S defaults, not blindly to all-permissions."""
-    try:
-        chat = await bot.get_chat(chat_id)
-        if getattr(chat, "permissions", None):
-            return chat.permissions
-    except TelegramError as exc:
-        logger.debug("Could not read chat permissions for %s: %s", chat_id, exc)
-    return ChatPermissions.all_permissions()
-
-
-async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                        action: str = "use this command") -> bool:
-    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
-    if not chat or not user or not message:
-        return False
-    if chat.type not in GROUP_TYPES:
-        await message.reply_text("This command only works in groups.")
-        return False
-    cfg, _ = state(context)
-    if await is_privileged(bot_of(context), chat.id, user.id, cfg):
-        return True
-    await message.reply_text(f"🔒 Only admins can {action}.")
-    return False
-
-
-async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[Optional[int], str]:
-    """Resolve a moderation target from reply, text mention, ID or @username."""
-    message = update.effective_message
-    if not message:
-        return None, ""
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target = message.reply_to_message.from_user
-        return target.id, target.full_name or str(target.id)
-    text = message.text or ""
-    for entity in message.entities or []:
-        if entity.type == MessageEntityType.TEXT_MENTION and entity.user:
-            return entity.user.id, entity.user.full_name or str(entity.user.id)
-    args = text.split()[1:]
-    if not args:
-        return None, ""
-    token = args[0]
-    if token.lstrip("-").isdigit():
-        return int(token), token
-    if token.startswith("@"):
-        try:
-            target_chat = await bot_of(context).get_chat(token)
-            return target_chat.id, getattr(target_chat, "full_name", None) or token
-        except TelegramError:
-            pass
-        _, db = state(context)
-        row = await db.run(db.find_by_username, update.effective_chat.id, token)
+    # ─ chat settings ─
+    async def get_settings(self, chat_id: int) -> dict:
+        row = await self._exec("SELECT antilink, antispam, ocr_protection, captcha_enabled FROM chat_settings WHERE chat_id=?", (chat_id,), fetch="one")
         if row:
-            return int(row["user_id"]), row["name"] or token
-    return None, ""
+            return {"antilink": bool(row[0]), "antispam": bool(row[1]), "ocr_protection": bool(row[2]), "captcha_enabled": bool(row[3])}
+        # insert defaults
+        await self._exec("INSERT OR IGNORE INTO chat_settings(chat_id, antilink, antispam, ocr_protection, captcha_enabled) VALUES(?,?,?,?,?)",
+                         (chat_id, DEFAULT_SETTINGS["antilink"], DEFAULT_SETTINGS["antispam"], DEFAULT_SETTINGS["ocr_protection"], DEFAULT_SETTINGS["captcha_enabled"]))
+        return {k: bool(v) for k, v in DEFAULT_SETTINGS.items()}
 
+    async def set_setting(self, chat_id: int, key: str, value: bool):
+        if key not in DEFAULT_SETTINGS:
+            return
+        # ensure row exists
+        await self.get_settings(chat_id)
+        await self._exec(f"UPDATE chat_settings SET {key}=? WHERE chat_id=?", (int(value), chat_id))
 
-def reason_from_args(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    args = list(context.args or [])
-    message = update.effective_message
-    if message and message.reply_to_message:
-        return " ".join(args).strip()
-    return " ".join(args[1:]).strip()
+    # ─ active users ─
+    async def upsert_active(self, chat_id: int, user_id: int, username: Optional[str], fullname: str):
+        await self._exec("""
+            INSERT INTO active_users(chat_id, user_id, username, fullname, last_seen)
+            VALUES(?,?,?,?,CURRENT_TIMESTAMP)
+            ON CONFLICT(chat_id, user_id) DO UPDATE SET username=excluded.username, fullname=excluded.fullname, last_seen=CURRENT_TIMESTAMP
+        """, (chat_id, user_id, username, fullname))
 
+    async def get_active_users(self, chat_id: int, limit: int = 200) -> List[Tuple[int, Optional[str], str]]:
+        rows = await self._exec("SELECT user_id, username, fullname FROM active_users WHERE chat_id=? ORDER BY last_seen DESC LIMIT ?", (chat_id, limit), fetch="all")
+        return rows or []
 
-async def target_guard(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                       target_id: int) -> bool:
-    message, chat = update.effective_message, update.effective_chat
-    bot = bot_of(context)
-    if target_id == getattr(bot, "id", None):
-        await message.reply_text("I can't moderate myself 🙂")
-        return False
-    if target_id == update.effective_user.id:
-        await message.reply_text("You can't moderate yourself.")
-        return False
-    if await is_admin(bot, chat.id, target_id):
-        await message.reply_text("Group administrators are protected from bot moderation.")
-        return False
-    return True
+    async def prune_inactive(self, days: int = 30):
+        await self._exec("DELETE FROM active_users WHERE last_seen < datetime('now', ?)", (f"-{days} days",))
 
+    # ─ games ─
+    async def start_game(self, chat_id: int, word: str, starter_id: int):
+        await self._exec("INSERT INTO games(chat_id, word, length, starter_id, attempts, is_active) VALUES(?,?,?,?,0,1) ON CONFLICT(chat_id) DO UPDATE SET word=excluded.word, length=excluded.length, starter_id=excluded.starter_id, attempts=0, is_active=1, started_at=CURRENT_TIMESTAMP",
+                         (chat_id, word.lower(), len(word), starter_id))
 
-async def kick_user(bot, chat_id: int, user_id: int) -> None:
-    """Ban + immediate unban == kick (user may rejoin with a new invite)."""
-    await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-    await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
+    async def get_game(self, chat_id: int) -> Optional[Tuple[str, int, int, int]]:
+        # returns (word, length, starter_id, attempts)
+        row = await self._exec("SELECT word, length, starter_id, attempts FROM games WHERE chat_id=? AND is_active=1", (chat_id,), fetch="one")
+        return row if row else None
 
+    async def bump_attempts(self, chat_id: int):
+        await self._exec("UPDATE games SET attempts=attempts+1 WHERE chat_id=?", (chat_id,))
 
-async def temp_reply(bot, chat_id: int, text: str, delay: float = 8.0,
-                     application: Optional[Application] = None) -> None:
-    try:
-        sent = await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
-        spawn(delete_later(bot, chat_id, sent.message_id, delay), application)
-    except TelegramError as exc:
-        logger.warning("Could not send temporary notice: %s", exc)
+    async def stop_game(self, chat_id: int):
+        await self._exec("UPDATE games SET is_active=0 WHERE chat_id=?", (chat_id,))
 
+    # ─ leaderboard ─
+    async def add_win(self, user_id: int, username: Optional[str]):
+        await self._exec("INSERT INTO leaderboard(user_id, username, wins, games_played) VALUES(?,?,1,1) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, wins=wins+1, games_played=games_played+1", (user_id, username or str(user_id)))
 
-def parse_duration(token: str) -> Optional[timedelta]:
-    match = DURATION_RE.match(token.strip()) if token else None
-    if not match:
+    async def add_played(self, user_id: int, username: Optional[str]):
+        await self._exec("INSERT INTO leaderboard(user_id, username, games_played) VALUES(?,?,1) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username, games_played=games_played+1", (user_id, username or str(user_id)))
+
+    async def top_players(self, limit: int = 10) -> List[Tuple[int, str, int]]:
+        rows = await self._exec("SELECT user_id, username, wins FROM leaderboard ORDER BY wins DESC, games_played DESC LIMIT ?", (limit,), fetch="all")
+        return rows or []
+
+db = Database(DB_PATH)
+
+# ──────────────────────────────────────────
+# Helpers & Decorators
+# ──────────────────────────────────────────
+def esc(s: str) -> str:
+    return html.escape(s or "", quote=False)
+
+def mention_html(user_id: int, name: str) -> str:
+    return f'<a href="tg://user?id={user_id}">{esc(name)}</a>'
+
+def parse_duration(s: str) -> Optional[datetime.timedelta]:
+    """Parse '30m', '2h', '1d', '1w' into timedelta."""
+    m = re.match(r"^\s*(\d+)\s*([smhdw])\s*$", s.strip(), re.I)
+    if not m:
         return None
-    amount, unit = int(match.group(1)), match.group(2).lower()
-    seconds = amount * {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit]
-    # Telegram treats <30s or >366d restrictions as permanent.
-    return timedelta(seconds=max(30, min(seconds, 366 * 86400)))
+    n, unit = int(m.group(1)), m.group(2).lower()
+    mul = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+    return datetime.timedelta(seconds=n * mul[unit])
 
-
-# --------------------------------------------------------------------------- #
-# 0. Admin rights, /connect scope and greeting helpers                         #
-# --------------------------------------------------------------------------- #
-
-DEFAULT_WELCOME = "Hey {first}, welcome to {group}! 🎉"
-DEFAULT_GOODBYE = "Goodbye {first}, thanks for being part of {group}. 👋"
-GREETING_HELP = ("Placeholders: <code>{first}</code> <code>{last}</code> <code>{fullname}</code> "
-                 "<code>{username}</code> <code>{mention}</code> <code>{id}</code> "
-                 "<code>{group}</code> <code>{count}</code>")
-RIGHT_LABELS = {"can_restrict_members": "Ban users", "can_change_info": "Change group info"}
-ANON_ADMIN_ID = 1087968824  # Telegram's GroupAnonymousBot
-CONNECTED_TEXT = ("🔗 Connected to <b>{title}</b>.\nYou can manage it from this chat:\n"
-                  "/welcome · /setwelcome · /rmwelcome\n"
-                  "/goodbye · /setgoodbye · /rmgoodbye\n"
-                  "/banned · /unban ID · /connection · /disconnect")
-
-
-async def has_right(bot, chat_id: int, user_id: int, right: str) -> bool:
-    """True for the group owner, or an admin who holds the given admin right."""
-    try:
-        member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-    except TelegramError as exc:
-        logger.debug("Rights lookup failed for %s in %s: %s", user_id, chat_id, exc)
+async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: Optional[int] = None) -> bool:
+    chat = update.effective_chat
+    if not chat:
         return False
-    if member.status == ST_OWNER:
+    uid = user_id or (update.effective_user.id if update.effective_user else None)
+    if not uid:
+        return False
+    # Owner bypass
+    if OWNER_ID and uid == OWNER_ID:
         return True
-    return member.status == ST_ADMIN and bool(getattr(member, right, False))
+    try:
+        m = await context.bot.get_chat_member(chat.id, uid)
+        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception:
+        return False
 
+async def is_owner_user(user_id: int) -> bool:
+    return bool(OWNER_ID and user_id == OWNER_ID)
 
-async def require_right(update: Update, context: ContextTypes.DEFAULT_TYPE, right: str,
-                        action: str) -> Optional[tuple[int, str]]:
-    """Authorise a command and resolve the group it applies to.
-
-    In a group the target is that group. In a private chat the target is the
-    group linked with /connect. Rights are re-checked on every call, so a
-    demoted admin loses access immediately. Returns (chat_id, title) or None.
-    """
-    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
-    if not chat or not user or not message:
+async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[Tuple[int, str]]:
+    """Resolve target user from reply or @username / ID arg."""
+    msg = update.effective_message
+    if not msg:
         return None
-    _, db = state(context)
-    if chat.type in GROUP_TYPES:
-        if message.sender_chat or user.id == ANON_ADMIN_ID:
-            await message.reply_text("Anonymous admins can't be verified. Turn off "
-                                     "“Remain anonymous” to use this command.")
-            return None
-        chat_id, title = chat.id, chat.title or "this group"
-    else:
-        link = await db.run(db.get_connection, user.id)
-        if not link:
-            await message.reply_text("No group is connected. Send /connect inside your group first.")
-            return None
-        chat_id, title = int(link["chat_id"]), link["title"] or "your group"
-    if await has_right(bot_of(context), chat_id, user.id, right):
-        return chat_id, title
-    await message.reply_text(f"🔒 Only the group owner or admins with the "
-                             f"“{RIGHT_LABELS.get(right, right)}” right can {action}.")
+    # 1) reply target
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        return u.id, u.full_name
+    # 2) arg
+    if context.args:
+        arg = context.args[0].lstrip("@")
+        # numeric ID
+        if arg.isdigit():
+            return int(arg), f"user {arg}"
+        # username — we can't resolve username to ID without extra lookup; store active pool attempt
+        # try to find in active DB
+        chat_id = update.effective_chat.id  # type: ignore
+        actives = await db.get_active_users(chat_id, limit=500)
+        for uid, uname, fname in actives:
+            if uname and uname.lower() == arg.lower():
+                return uid, fname
+        # fallback: treat as unknown but return failure
+        return None
     return None
 
+async def get_target_or_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    tgt = await resolve_target(update, context)
+    return tgt
 
-def render_greeting(template: str, user: Any, title: str, count: Optional[int]) -> str:
-    """Fill {placeholders} with escaped values; unknown tokens are left as typed."""
-    first = getattr(user, "first_name", "") or "there"
-    username = getattr(user, "username", "") or ""
-    link = mention(user.id, first)
-    values = {
-        "first": esc(first),
-        "last": esc(getattr(user, "last_name", "") or ""),
-        "fullname": esc(getattr(user, "full_name", "") or first),
-        "username": "@" + esc(username) if username else link,
-        "mention": link,
-        "id": str(user.id),
-        "group": esc(title), "groupname": esc(title), "group name": esc(title),
-        "chatname": esc(title),
-        "count": str(count) if count else "",
-    }
-    return re.sub(r"\{([a-z ]+)\}", lambda m: values.get(m.group(1).lower(), m.group(0)),
-                  esc(template), flags=re.IGNORECASE)
-
-
-async def profile_photo_id(bot, user_id: int) -> Optional[str]:
-    """Largest size of the member's current profile photo, if bots may see it."""
+async def send_temp_notice(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, ttl: int = ILLEGAL_NOTICE_TTL):
+    """Send a temporary bot notice that auto-deletes after ttl."""
     try:
-        photos = await bot.get_user_profile_photos(user_id, limit=1)
-        if photos.total_count and photos.photos:
-            return photos.photos[0][-1].file_id
-    except TelegramError as exc:
-        logger.debug("Profile photo lookup failed for %s: %s", user_id, exc)
-    return None
+        m = await context.bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
+        # schedule deletion
+        if context.job_queue:
+            context.job_queue.run_once(lambda ctx: asyncio.create_task(_delete_later(ctx, chat_id, m.message_id)), ttl, name=f"del_notice_{chat_id}_{m.message_id}")
+        else:
+            asyncio.create_task(_auto_delete_later(context, chat_id, m.message_id, ttl))
+        return m
+    except Exception as e:
+        log.debug("send_temp_notice failed: %s", e)
 
+async def _delete_later(ctx, chat_id: int, msg_id: int):
+    try:
+        await ctx.bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
 
-async def send_greeting(bot, db: Database, chat_id: int, title: str, user: Any, kind: str) -> None:
-    """Send the custom (or default) welcome/goodbye, with a photo when available.
+async def _auto_delete_later(context, chat_id, msg_id, ttl):
+    await asyncio.sleep(ttl)
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
 
-    Welcome photo priority: the photo saved with /setwelcome, otherwise the new
-    member's own profile photo, otherwise plain text.
-    """
-    row = await db.run(db.get_greeting, chat_id, kind) or {}
-    if row and not row.get("enabled", 1):
+def admin_required(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not await is_admin(update, context):
+            if update.effective_message:
+                await update.effective_message.reply_text("🚫 Only admins can use this command.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+def owner_required(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        uid = update.effective_user.id if update.effective_user else 0
+        if not await is_owner_user(uid):
+            if update.effective_message:
+                await update.effective_message.reply_text("🔒 Owner-only command.")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+# ──────────────────────────────────────────
+# Moderation Commands
+# ──────────────────────────────────────────
+@admin_required
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Usage: reply to a user or <code>/ban @username|ID [reason]</code>", parse_mode=ParseMode.HTML)
         return
-    template = row.get("text") or (DEFAULT_WELCOME if kind == "welcome" else DEFAULT_GOODBYE)
-    count: Optional[int] = None
-    if "{count}" in template.lower():
+    uid, name = tgt
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "Banned by admin"
+    # prevent banning admins/owner/bot
+    if OWNER_ID and uid == OWNER_ID:
+        await msg.reply_text("I can't ban my owner.")
+        return
+    if await is_admin(update, context, uid):
+        await msg.reply_text("I can't ban an admin — demote first.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat.id, uid)
+        await msg.reply_html(f"🔨 Banned {mention_html(uid, name)} — <i>{esc(reason)}</i>")
+        log.info("BAN %s -> %s (%s)", chat.id, uid, reason)
+    except BadRequest as e:
+        await msg.reply_text(f"Ban failed: {e.message}")
+    except Exception as e:
+        await msg.reply_text(f"Error: {e}")
+
+@admin_required
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Usage: reply or <code>/unban @username|ID</code>", parse_mode=ParseMode.HTML)
+        return
+    uid, name = tgt
+    try:
+        await context.bot.unban_chat_member(chat.id, uid)
+        await msg.reply_html(f"✅ Unbanned {mention_html(uid, name)}")
+    except Exception as e:
+        await msg.reply_text(f"Unban failed: {e}")
+
+@admin_required
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Usage: reply or <code>/mute @username|ID [duration: 30m/2h/1d]</code>", parse_mode=ParseMode.HTML)
+        return
+    uid, name = tgt
+    if await is_admin(update, context, uid):
+        await msg.reply_text("Can't mute an admin.")
+        return
+    # optional duration is last arg if parseable
+    until = None
+    dur_text = ""
+    if context.args and len(context.args) >= 2:
+        dur = parse_duration(context.args[-1])
+        if dur:
+            until = datetime.datetime.now(datetime.timezone.utc) + dur
+            dur_text = f" for {context.args[-1]}"
+    try:
+        perms = ChatPermissions(can_send_messages=False)
+        await context.bot.restrict_chat_member(chat.id, uid, permissions=perms, until_date=until)
+        await msg.reply_html(f"🔇 Muted {mention_html(uid, name)}{esc(dur_text)}")
+    except Exception as e:
+        await msg.reply_text(f"Mute failed: {e}")
+
+@admin_required
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Usage: reply or <code>/unmute @username|ID</code>", parse_mode=ParseMode.HTML)
+        return
+    uid, name = tgt
+    try:
+        perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True)
+        await context.bot.restrict_chat_member(chat.id, uid, permissions=perms)
+        await msg.reply_html(f"🔊 Unmuted {mention_html(uid, name)}")
+    except Exception as e:
+        await msg.reply_text(f"Unmute failed: {e}")
+
+@admin_required
+async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Usage: reply or <code>/warn @username|ID [reason]</code>", parse_mode=ParseMode.HTML)
+        return
+    uid, name = tgt
+    if await is_admin(update, context, uid):
+        await msg.reply_text("Can't warn an admin.")
+        return
+    reason = " ".join(context.args[1:]) if len(context.args) > 1 else "No reason"
+    count = await db.add_warn(chat.id, uid, reason)
+    await msg.reply_html(f"⚠️ Warned {mention_html(uid, name)} ({count}/{WARN_LIMIT}) — <i>{esc(reason)}</i>")
+    if count >= WARN_LIMIT:
         try:
-            count = await bot.get_chat_member_count(chat_id)
-        except TelegramError:
-            count = None
-    text = render_greeting(template, user, title, count)
-    photo = row.get("photo_id")
-    if not photo and kind == "welcome":
-        photo = await profile_photo_id(bot, user.id)
-    try:
-        if photo and len(text) <= 1024:  # Telegram's caption limit
-            await bot.send_photo(chat_id=chat_id, photo=photo, caption=text,
-                                 parse_mode=ParseMode.HTML)
+            await context.bot.ban_chat_member(chat.id, uid)
+            await context.bot.send_message(chat.id, f"🚫 {mention_html(uid, name)} reached {WARN_LIMIT} warnings and was <b>banned</b>.", parse_mode=ParseMode.HTML)
+            await db.reset_warns(chat.id, uid)
+            log.info("AUTOBAN via warns %s -> %s", chat.id, uid)
+        except Exception as e:
+            await msg.reply_text(f"Auto-ban failed: {e}")
+            await db.reset_warns(chat.id, uid)
+
+async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # check own or target
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if tgt:
+        uid, name = tgt
+    else:
+        # self check requires reply or sender
+        if msg.reply_to_message and msg.reply_to_message.from_user:
+            uid = msg.reply_to_message.from_user.id
+            name = msg.reply_to_message.from_user.full_name
+        else:
+            uid = update.effective_user.id
+            name = update.effective_user.full_name
+    c = await db.get_warns(chat.id, uid)
+    await msg.reply_html(f"📋 {mention_html(uid, name)} has {c}/{WARN_LIMIT} warnings.")
+
+# ──────────────────────────────────────────
+# Rules & Notes
+# ──────────────────────────────────────────
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    content = await db.get_rules(chat.id)
+    if not content:
+        await update.effective_message.reply_text("No rules set. Admins can set with /setrules.")
+        return
+    await update.effective_message.reply_html(f"📜 <b>Rules for {esc(chat.title or str(chat.id))}</b>:\n\n{content}")
+
+@admin_required
+async def cmd_setrules(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    text = ""
+    if context.args:
+        text = " ".join(context.args)
+    elif msg.reply_to_message and msg.reply_to_message.text:
+        text = msg.reply_to_message.text
+    if not text.strip():
+        await msg.reply_text("Usage: <code>/setrules Your rules text</code> or reply to a message with /setrules", parse_mode=ParseMode.HTML)
+        return
+    # allow HTML
+    await db.set_rules(chat.id, text)
+    await msg.reply_text("✅ Rules updated.")
+
+# Notes: #note trigger + commands
+@admin_required
+async def cmd_setnote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not context.args:
+        await msg.reply_text("Usage: <code>/setnote &lt;name&gt; &lt;text&gt;</code> or reply with <code>/setnote &lt;name&gt;</code>", parse_mode=ParseMode.HTML)
+        return
+    name = context.args[0]
+    if msg.reply_to_message and (msg.reply_to_message.text or msg.reply_to_message.caption):
+        content = msg.reply_to_message.text or msg.reply_to_message.caption
+    else:
+        if len(context.args) < 2:
+            await msg.reply_text("Provide note content or reply to a message.")
             return
-        if photo:
-            await bot.send_photo(chat_id=chat_id, photo=photo)
-    except TelegramError as exc:
-        logger.debug("Greeting photo failed in %s: %s", chat_id, exc)
-    try:
-        await send_long(bot, chat_id, text)
-    except TelegramError as exc:
-        logger.warning("Could not send the %s message in %s: %s", kind, chat_id, exc)
+        content = " ".join(context.args[1:])
+    await db.set_note(chat.id, name, content, update.effective_user.id)
+    await msg.reply_html(f"💾 Saved note <code>#{esc(name.lower())}</code>")
 
+# alias /note uses same logic
+cmd_note_alias = cmd_setnote
 
-# --------------------------------------------------------------------------- #
-# 1. Core moderation commands                                                  #
-# --------------------------------------------------------------------------- #
-
-async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_right(update, context, "can_restrict_members", "ban members"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None or not await target_guard(update, context, target_id):
-        await message.reply_text("Usage: reply to a user with <code>/ban [reason]</code> "
-                                 "or use <code>/ban 123456789 [reason]</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    reason = reason_from_args(update, context) or "no reason provided"
-    bot, (_, db) = bot_of(context), state(context)
-    try:
-        await bot.ban_chat_member(chat_id=chat.id, user_id=target_id, revoke_messages=False)
-    except Forbidden:
-        await message.reply_text("I need the <b>Ban users</b> admin right.")
-        return
-    except BadRequest as exc:
-        await message.reply_text(f"Could not ban: {esc(exc.message)}", parse_mode=ParseMode.HTML)
-        return
-    await db.run(db.reset_warns, chat.id, target_id)
-    await db.run(db.finish_captcha, chat.id, target_id)
-    await db.run(db.add_ban, chat.id, target_id, name, reason, update.effective_user.id)
-    await message.reply_text(f"🔨 {mention(target_id, name)} banned.\n<i>Reason:</i> {esc(reason)}",
-                             parse_mode=ParseMode.HTML)
-    logger.info("ban chat=%s target=%s by=%s", chat.id, target_id, update.effective_user.id)
-
-
-async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    scope = await require_right(update, context, "can_restrict_members", "unban members")
-    if not scope:
-        return
-    # In a private chat the target is the group linked with /connect.
-    message, chat = update.effective_message, SimpleNamespace(id=scope[0])
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: <code>/unban 123456789</code> (a numeric ID is required).",
-                                 parse_mode=ParseMode.HTML)
-        return
-    try:
-        await bot_of(context).unban_chat_member(chat.id, target_id, only_if_banned=True)
-    except TelegramError as exc:
-        await message.reply_text(f"Could not unban: {esc(exc)}", parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    await db.run(db.remove_ban, chat.id, target_id)
-    await message.reply_text(f"✅ {mention(target_id, name)} may join again.", parse_mode=ParseMode.HTML)
-
-
-async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_right(update, context, "can_restrict_members", "mute members"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None or not await target_guard(update, context, target_id):
-        await message.reply_text("Usage: reply with <code>/mute [30m|2h|1d]</code>; "
-                                 "omit the duration for a permanent mute.", parse_mode=ParseMode.HTML)
-        return
-    args = list(context.args or [])
-    duration_token = "" if message.reply_to_message else (args[1] if len(args) > 1 else "")
-    if message.reply_to_message and args:
-        duration_token = args[0]
-    delta = parse_duration(duration_token)
-    until_date = datetime.now(timezone.utc) + delta if delta else None
-    try:
-        await bot_of(context).restrict_chat_member(
-            chat_id=chat.id, user_id=target_id,
-            permissions=ChatPermissions.no_permissions(), until_date=until_date,
-        )
-    except Forbidden:
-        await message.reply_text("I need the <b>Restrict members</b> admin right.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    except BadRequest as exc:
-        await message.reply_text(f"Could not mute: {esc(exc.message)}", parse_mode=ParseMode.HTML)
-        return
-    span = f" for <b>{esc(duration_token)}</b>" if delta else " indefinitely"
-    await message.reply_text(f"🔇 {mention(target_id, name)} muted{span}.", parse_mode=ParseMode.HTML)
-
-
-async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_right(update, context, "can_restrict_members", "unmute members"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: reply to a muted user with <code>/unmute</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    bot = bot_of(context)
-    try:
-        await bot.restrict_chat_member(chat_id=chat.id, user_id=target_id,
-                                       permissions=await default_permissions(bot, chat.id))
-    except TelegramError as exc:
-        await message.reply_text(f"Could not unmute: {esc(exc)}", parse_mode=ParseMode.HTML)
-        return
-    await message.reply_text(f"🔊 {mention(target_id, name)} can speak again.",
-                             parse_mode=ParseMode.HTML)
-
-
-async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_right(update, context, "can_restrict_members", "warn members"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None or not await target_guard(update, context, target_id):
-        await message.reply_text("Usage: reply to a user with <code>/warn [reason]</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    cfg, db = state(context)
-    count = await db.run(db.add_warn, chat.id, target_id)
-    reason = reason_from_args(update, context) or "no reason provided"
-    who = mention(target_id, name)
-    if count >= cfg.warn_limit:
-        try:
-            await bot_of(context).ban_chat_member(chat.id, target_id)
-            await db.run(db.add_ban, chat.id, target_id, name, f"{count} warnings",
-                         update.effective_user.id)
-            await db.run(db.reset_warns, chat.id, target_id)
-            await message.reply_text(
-                f"⛔ {who} reached <b>{count}/{cfg.warn_limit}</b> warnings and was banned.\n"
-                f"<i>Last reason:</i> {esc(reason)}", parse_mode=ParseMode.HTML)
-        except TelegramError as exc:
-            logger.warning("Auto-ban failed for %s: %s", target_id, exc)
-            await message.reply_text(f"⚠️ {who} reached the warning limit, but the ban failed.",
-                                     parse_mode=ParseMode.HTML)
-    else:
-        await message.reply_text(
-            f"⚠️ Warning <b>{count}/{cfg.warn_limit}</b> for {who}.\n"
-            f"<i>Reason:</i> {esc(reason)}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_right(update, context, "can_restrict_members", "inspect warnings"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: reply to a user with <code>/warns</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    cfg, db = state(context)
-    count = await db.run(db.get_warns, chat.id, target_id)
-    await message.reply_text(f"📋 {mention(target_id, name)} has <b>{count}/{cfg.warn_limit}</b> warnings.",
-                             parse_mode=ParseMode.HTML)
-
-
-# --------------------------------------------------------------------------- #
-# 1a. Kick, ban list, welcome/goodbye and /connect commands                    #
-# --------------------------------------------------------------------------- #
-
-async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Remove a member without a lasting ban (they can rejoin with an invite)."""
-    if not await require_right(update, context, "can_restrict_members", "kick members"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: reply to a user with <code>/kick [reason]</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    if not await target_guard(update, context, target_id):
-        return
-    reason = reason_from_args(update, context) or "no reason provided"
-    try:
-        await kick_user(bot_of(context), chat.id, target_id)
-    except TelegramError as exc:
-        await message.reply_text(f"Could not kick: {esc(exc)}", parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    await db.run(db.finish_captcha, message.chat_id, target_id)
-    await db.run(db.remove_member, chat.id, target_id)
-    await message.reply_text(f"👢 {mention(target_id, name)} was kicked.\n"
-                             f"<i>Reason:</i> {esc(reason)}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_banned(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List recorded bans. Telegram has no 'list banned users' API, so the bot
-    keeps its own list from its commands and from chat_member updates."""
-    scope = await require_right(update, context, "can_restrict_members", "view the ban list")
-    if not scope:
-        return
-    chat_id, title = scope
-    _, db = state(context)
-    rows = await db.run(db.list_bans, chat_id, 50)
-    if not rows:
-        await update.effective_message.reply_text(f"No banned members recorded for {title}.")
-        return
-    lines = [f"🚫 <b>Banned in {esc(title)}</b> ({len(rows)} shown)"]
-    for row in rows:
-        when = datetime.fromtimestamp(float(row["banned_at"]), timezone.utc).strftime("%Y-%m-%d")
-        reason = f" · {esc(row['reason'])}" if row["reason"] else ""
-        lines.append(f"• {mention(int(row['user_id']), row['name'] or row['user_id'])} "
-                     f"<code>{row['user_id']}</code> · {when}{reason}")
-    lines.append("\nLift a ban with <code>/unban USER_ID</code>.")
-    await send_long(bot_of(context), update.effective_chat.id, "\n".join(lines))
-
-
-def greeting_kind(message: Any) -> str:
-    """'/setgoodbye', '/rmgoodbye', '/goodbye' -> goodbye; everything else -> welcome."""
-    command = ((message.text or message.caption or "").split() or [""])[0].lower()
-    return "goodbye" if "goodbye" in command else "welcome"
-
-
-async def cmd_show_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/welcome and /goodbye: show the saved message; 'on' / 'off' toggles it."""
-    message = update.effective_message
-    kind = greeting_kind(message)
-    scope = await require_right(update, context, "can_change_info", f"manage the {kind} message")
-    if not scope:
-        return
-    chat_id, title = scope
-    _, db = state(context)
-    arg = command_payload(message).lower()
-    if arg in ("on", "off"):
-        await db.run(db.set_greeting_enabled, chat_id, kind, arg == "on", update.effective_user.id)
-        await message.reply_text(f"{kind.title()} messages are now <b>{arg.upper()}</b> "
-                                 f"for {esc(title)}.", parse_mode=ParseMode.HTML)
-        return
-    row = await db.run(db.get_greeting, chat_id, kind) or {}
-    template = row.get("text") or (DEFAULT_WELCOME if kind == "welcome" else DEFAULT_GOODBYE)
-    if row.get("photo_id"):
-        photo = "custom photo"
-    else:
-        photo = "member's profile photo" if kind == "welcome" else "none"
-    await send_long(
-        bot_of(context), update.effective_chat.id,
-        f"💬 <b>{kind.title()} message for {esc(title)}</b>\n"
-        f"Status: <b>{'ON' if row.get('enabled', 1) else 'OFF'}</b> · "
-        f"Text: <b>{'custom' if row.get('text') else 'default'}</b> · Photo: <b>{photo}</b>\n\n"
-        f"<code>{esc(template)}</code>\n\n<b>Preview</b>\n"
-        f"{render_greeting(template, update.effective_user, title, None)}\n\n{GREETING_HELP}")
-
-
-async def cmd_set_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/setwelcome and /setgoodbye: custom text plus an optional photo.
-
-    The photo can be attached to the command (as its caption) or the command
-    can be sent as a reply to a photo.
-    """
-    message = update.effective_message
-    kind = greeting_kind(message)
-    scope = await require_right(update, context, "can_change_info", f"set the {kind} message")
-    if not scope:
-        return
-    chat_id, title = scope
-    text = command_payload(message)
-    reply = message.reply_to_message
-    source = message if message.photo else (reply if reply and reply.photo else None)
-    photo_id = source.photo[-1].file_id if source else None
-    if not text and reply and not message.photo:
-        text = (reply.text or reply.caption or "").strip()
-    if not text and not photo_id:
-        await message.reply_text(
-            f"Usage: <code>/set{kind} Hey {{first}}, welcome to {{group}}!</code>\n"
-            f"Reply to a photo with the command to attach it.\n{GREETING_HELP}",
-            parse_mode=ParseMode.HTML)
-        return
-    if len(text) > 3500:
-        await message.reply_text("That message is too long (3500 characters max).")
-        return
-    _, db = state(context)
-    await db.run(db.set_greeting, chat_id, kind, text or None, photo_id, update.effective_user.id)
-    await message.reply_text(
-        f"✅ {kind.title()} message saved for <b>{esc(title)}</b>"
-        f"{' with a photo' if photo_id else ''}. Use /{kind} to preview it.",
-        parse_mode=ParseMode.HTML)
-
-
-async def cmd_rm_greeting(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/rmwelcome and /rmgoodbye: delete the custom message, back to the default."""
-    message = update.effective_message
-    kind = greeting_kind(message)
-    scope = await require_right(update, context, "can_change_info", f"remove the {kind} message")
-    if not scope:
-        return
-    chat_id, title = scope
-    _, db = state(context)
-    if await db.run(db.delete_greeting, chat_id, kind):
-        text = f"🗑️ Custom {kind} message deleted for <b>{esc(title)}</b>. The default is active again."
-    else:
-        text = f"No custom {kind} message is set for <b>{esc(title)}</b>."
-    await message.reply_text(text, parse_mode=ParseMode.HTML)
-
-
-async def connect_user(bot, db: Database, user_id: int, chat_id: int) -> Optional[str]:
-    """Link a group to a user's private chat. Owner or 'Change group info' only."""
-    if not await has_right(bot, chat_id, user_id, "can_change_info"):
-        return None
-    try:
-        title = (await bot.get_chat(chat_id)).title or str(chat_id)
-    except TelegramError:
-        title = str(chat_id)
-    await db.run(db.set_connection, user_id, chat_id, title)
-    return title
-
-
-async def cmd_connect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/connect in a group (or '/connect CHAT_ID' in private) links it to your PM."""
-    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
-    bot = bot_of(context)
-    _, db = state(context)
-    in_group = chat.type in GROUP_TYPES
-    if in_group:
-        if message.sender_chat or user.id == ANON_ADMIN_ID:
-            await message.reply_text("Turn off “Remain anonymous” to connect this group.")
+async def cmd_getnote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not context.args:
+        notes = await db.list_notes(chat.id)
+        if not notes:
+            await msg.reply_text("No notes saved. Use /setnote <name> <text>")
             return
-        chat_id = chat.id
-    else:
-        arg = (context.args or [""])[0]
-        if not arg.lstrip("-").isdigit():
-            link = await db.run(db.get_connection, user.id)
-            current = f"Currently connected to <b>{esc(link['title'])}</b>.\n" if link else ""
-            await message.reply_text(
-                current + "Send /connect inside your group, or "
-                "<code>/connect -1001234567890</code> here.", parse_mode=ParseMode.HTML)
-            return
-        chat_id = int(arg)
-    title = await connect_user(bot, db, user.id, chat_id)
-    if not title:
-        await message.reply_text("🔒 Only the group owner or admins with the "
-                                 "“Change group info” right can connect a group.")
+        await msg.reply_html("🗒 <b>Saved notes:</b>\n" + "\n".join(f"• <code>#{esc(n)}</code>" for n in notes))
         return
-    if in_group:
-        button = InlineKeyboardButton("💬 Manage in private chat",
-                                      url=f"https://t.me/{bot.username}?start=connect_{chat_id}")
-        await message.reply_text(f"🔗 <b>{esc(title)}</b> is now connected to your private chat with me.",
-                                 parse_mode=ParseMode.HTML,
-                                 reply_markup=InlineKeyboardMarkup([[button]]))
+    name = context.args[0].lstrip("#")
+    content = await db.get_note(chat.id, name)
+    if not content:
+        await msg.reply_html(f"Note <code>#{esc(name)}</code> not found.")
+        return
+    await msg.reply_html(content)
+
+@admin_required
+async def cmd_delnote(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not context.args:
+        await msg.reply_text("Usage: /delnote <name>")
+        return
+    name = context.args[0].lstrip("#")
+    cnt = await db.del_note(chat.id, name)
+    if cnt:
+        await msg.reply_html(f"🗑 Deleted note <code>#{esc(name)}</code>")
     else:
-        await message.reply_text(CONNECTED_TEXT.format(title=esc(title)), parse_mode=ParseMode.HTML)
+        await msg.reply_html(f"Note <code>#{esc(name)}</code> not found.")
 
+# hashtag auto-trigger for notes: messages like #mynote
+async def hashtag_note_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    # only single #word messages (or starting with #)
+    m = re.match(r"^#(\w+)\b", msg.text.strip())
+    if not m:
+        return
+    chat = update.effective_chat
+    content = await db.get_note(chat.id, m.group(1))
+    if content:
+        await msg.reply_html(content)
 
-async def cmd_connection(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, db = state(context)
-    link = await db.run(db.get_connection, update.effective_user.id)
-    text = (f"🔗 Connected to <b>{esc(link['title'])}</b> (<code>{link['chat_id']}</code>)."
-            if link else "Not connected. Send /connect inside your group.")
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
+# ──────────────────────────────────────────
+# Trust system
+# ──────────────────────────────────────────
+@admin_required
+async def cmd_trust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Reply to a user or use /trust @username|ID")
+        return
+    uid, name = tgt
+    await db.trust(chat.id, uid, update.effective_user.id)
+    await msg.reply_html(f"✅ Trusted {mention_html(uid, name)} — bypasses link/spam filters.")
 
+@admin_required
+async def cmd_untrust(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    tgt = await get_target_or_reply(update, context)
+    if not tgt:
+        await msg.reply_text("Reply to a user or use /untrust @username|ID")
+        return
+    uid, name = tgt
+    await db.untrust(chat.id, uid)
+    await msg.reply_html(f"❌ Untrusted {mention_html(uid, name)}")
 
-async def cmd_disconnect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, db = state(context)
-    await db.run(db.clear_connection, update.effective_user.id)
-    await update.effective_message.reply_text("🔌 Disconnected. Use /connect in a group to link again.")
+# ──────────────────────────────────────────
+# Global Banned-Word Vault (Owner-only)
+# ──────────────────────────────────────────
+@owner_required
+async def cmd_addbanword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /addbword <word_or_phrase>\nOwner-only. Applies instantly across all groups.")
+        return
+    phrase = " ".join(context.args).strip()
+    await db.add_global_word(phrase, update.effective_user.id)
+    await update.effective_message.reply_html(f"🔒 Added to global vault: <code>{esc(phrase.lower())}</code>")
 
+@owner_required
+async def cmd_rmbanword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /rmbword <word_or_phrase>")
+        return
+    phrase = " ".join(context.args).strip()
+    cnt = await db.remove_global_word(phrase)
+    if cnt:
+        await update.effective_message.reply_html(f"🔓 Removed: <code>{esc(phrase.lower())}</code>")
+    else:
+        await update.effective_message.reply_text("Word not found in vault.")
 
-async def track_membership(change: Any, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Sync the ban list and member roster, and say goodbye to leavers.
+@owner_required
+async def cmd_listbanwords(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    words = await db.list_global_words()
+    if not words:
+        await update.effective_message.reply_text("Global vault is empty.")
+        return
+    txt = "\n".join(f"• <code>{esc(w)}</code>" for w in words[:100])
+    if len(words) > 100:
+        txt += f"\n… and {len(words)-100} more"
+    await update.effective_message.reply_html(f"🌐 <b>Global Banned Vault ({len(words)}):</b>\n{txt}")
 
-    Returns True when the update is fully handled (no captcha needed).
-    """
-    new, old = change.new_chat_member, change.old_chat_member
-    user, chat = new.user, change.chat
-    bot = bot_of(context)
-    cfg, db = state(context)
-    title = chat.title or "the group"
-    if new.status == ST_BANNED:  # also catches bans made by human admins
-        actor = change.from_user.id if change.from_user else 0
-        await db.run(db.add_ban, chat.id, user.id, user.full_name or "", "", actor, False)
-    elif old.status == ST_BANNED:
-        await db.run(db.remove_ban, chat.id, user.id)
-    if memberish(old) and not memberish(new):
-        pending = await db.run(db.get_captcha, chat.id, user.id)
-        await db.run(db.remove_member, chat.id, user.id)
-        if pending:  # left before verifying: clean up quietly, no goodbye
-            await db.run(db.finish_captcha, chat.id, user.id)
-            await safe_delete(bot, chat.id, int(pending["message_id"]))
-        elif new.status == ST_LEFT and not user.is_bot:
-            await send_greeting(bot, db, chat.id, title, user, "goodbye")
+# ──────────────────────────────────────────
+# Security Locks, Anti-Link/Spam + OCR Pipeline
+# ──────────────────────────────────────────
+async def check_bypass(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Trusted/admins bypass filters."""
+    user = update.effective_user
+    chat = update.effective_chat
+    if not user or not chat:
         return True
-    if not memberish(old) and memberish(new):
-        await db.run(db.touch_activity, chat.id, user)  # joiners are mentionable at once
-        if not user.is_bot and user.id in cfg.owner_ids:
-            await send_greeting(bot, db, chat.id, title, user, "welcome")  # owners skip captcha
-            return True
+    if await is_owner_user(user.id):
+        return True
+    if await is_admin(update, context, user.id):
+        return True
+    if await db.is_trusted(chat.id, user.id):
+        return True
     return False
 
-
-# --------------------------------------------------------------------------- #
-# 1b. Persistent rules and reference notes                                     #
-# --------------------------------------------------------------------------- #
-
-async def cmd_setrules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "set rules"):
+async def handle_security_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group 0: link/spam/banned-word guard for TEXT messages."""
+    msg = update.effective_message
+    if not msg or not update.effective_chat or update.effective_chat.type == "private":
         return
-    message, chat = update.effective_message, update.effective_chat
-    text = command_payload(message)
+    # Ignore bots/commands that are not plain text triggers
+    if msg.text and msg.text.startswith("/"):
+        # still check banned words in commands? no
+        return
+    if await check_bypass(update, context):
+        return
+    chat_id = update.effective_chat.id
+    settings = await db.get_settings(chat_id)
+    text = msg.text or msg.caption or ""
     if not text:
-        await message.reply_text("Usage: <code>/setrules Be kind. No spam.</code>",
-                                 parse_mode=ParseMode.HTML)
-        return
-    if len(text) > 8000:
-        await message.reply_text("Rules are limited to 8000 characters.")
-        return
-    _, db = state(context)
-    await db.run(db.set_rules, chat.id, text, update.effective_user.id)
-    await message.reply_text("📜 Rules saved permanently for this chat.")
-
-
-async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, db = state(context)
-    row = await db.run(db.get_rules, update.effective_chat.id)
-    if not row:
-        await update.effective_message.reply_text("No rules saved yet. An admin can use /setrules.")
-        return
-    await send_long(bot_of(context), update.effective_chat.id,
-                    f"📜 <b>Group rules</b>\n\n{esc(row['text'])}")
-
-
-async def cmd_setnote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "save notes"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    payload = command_payload(message)
-    if "|" in payload:
-        name, text = (part.strip() for part in payload.split("|", 1))
-    else:
-        parts = payload.split(None, 1)
-        name = parts[0].strip() if parts else ""
-        text = parts[1].strip() if len(parts) > 1 else ""
-    if not NOTE_NAME_RE.match(name) or not text:
-        await message.reply_text(
-            "Usage: <code>/setnote faq | Our FAQ lives at example.com</code>\n"
-            "Names may contain letters, digits, _ and - (max 32 chars).",
-            parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    await db.run(db.set_note, chat.id, name.lower(), text, update.effective_user.id)
-    await message.reply_text(f"🗂️ Note <code>{esc(name.lower())}</code> saved.", parse_mode=ParseMode.HTML)
-
-
-async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, db = state(context)
-    name = command_payload(update.effective_message).split()[0].lower() if command_payload(update.effective_message) else ""
-    if not name:
-        notes = await db.run(db.list_notes, update.effective_chat.id)
-        listing = ", ".join(f"<code>{esc(n['name'])}</code>" for n in notes) or "none yet"
-        await update.effective_message.reply_text(f"🗂️ Saved notes: {listing}\nUse <code>/note name</code>.",
-                                                  parse_mode=ParseMode.HTML)
-        return
-    row = await db.run(db.get_note, update.effective_chat.id, name)
-    if not row:
-        await update.effective_message.reply_text(f"No note named <code>{esc(name)}</code>.",
-                                                  parse_mode=ParseMode.HTML)
-        return
-    await send_long(bot_of(context), update.effective_chat.id,
-                    f"🗂️ <b>{esc(name)}</b>\n\n{esc(row['text'])}")
-
-
-async def cmd_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await cmd_note(update, context)  # no argument -> list view
-
-
-async def cmd_delnote(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "delete notes"):
-        return
-    name = command_payload(update.effective_message).strip().lower()
-    _, db = state(context)
-    removed = await db.run(db.delete_note, update.effective_chat.id, name)
-    await update.effective_message.reply_text(
-        f"🗑️ Note <code>{esc(name)}</code> {'deleted' if removed else 'not found'}.",
-        parse_mode=ParseMode.HTML)
-
-
-async def cmd_trust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "manage link trust"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: reply to a user with <code>/trust</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    await db.run(db.set_link_trust, chat.id, target_id, update.effective_user.id)
-    await message.reply_text(f"✅ {mention(target_id, name)} may now post links.",
-                             parse_mode=ParseMode.HTML)
-
-
-async def cmd_untrust(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "manage link trust"):
-        return
-    message, chat = update.effective_message, update.effective_chat
-    target_id, name = await resolve_target(update, context)
-    if target_id is None:
-        await message.reply_text("Usage: reply to a user with <code>/untrust</code>.",
-                                 parse_mode=ParseMode.HTML)
-        return
-    _, db = state(context)
-    await db.run(db.remove_link_trust, chat.id, target_id)
-    await message.reply_text(f"🚫 Link exemption removed for {mention(target_id, name)}.",
-                             parse_mode=ParseMode.HTML)
-
-
-# --------------------------------------------------------------------------- #
-# 2. Link / keyword / OCR safeguards                                           #
-# --------------------------------------------------------------------------- #
-
-def extract_links(message: Any) -> set[str]:
-    """Catch raw URLs, t.me invites and Telegram URL / TEXT_LINK entities."""
-    text = message.text or message.caption or ""
-    found = {match.group(0) for match in LINK_RE.finditer(text)}
-    for entity in list(message.entities or []) + list(message.caption_entities or []):
-        if entity.type == MessageEntityType.URL:
-            found.add(text[entity.offset:entity.offset + entity.length])
-        elif entity.type == MessageEntityType.TEXT_LINK and entity.url:
-            found.add(entity.url)
-    return {link for link in found if link}
-
-
-def allowed_link(link: str, cfg: Config) -> bool:
-    candidate = link if "://" in link else "https://" + link.lstrip("@")
-    host = (urlparse(candidate).hostname or "").lower()
-    return any(host == domain or host.endswith("." + domain) for domain in cfg.allowed_domains)
-
-
-async def enforce_link_policy(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                              privileged: bool) -> bool:
-    """Delete unapproved links and post a temporary warning. True == consumed."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    cfg, db = state(context)
-    links = extract_links(message)
-    if not links or all(allowed_link(link, cfg) for link in links):
-        return False
-    if (privileged or user.id in cfg.link_whitelist
-            or await db.run(db.is_link_trusted, chat.id, user.id)):
-        return False
-    bot = bot_of(context)
-    await safe_delete(bot, chat.id, message.message_id)
-    await temp_reply(bot, chat.id,
-                     f"🚫 {mention(user.id, user.full_name)}, unapproved links are not allowed here. "
-                     "Ask an admin for permission. <i>(This notice disappears shortly.)</i>",
-                     delay=8, application=context.application)
-    logger.info("link removed chat=%s user=%s count=%d", chat.id, user.id, len(links))
-    return True
-
-
-async def enforce_content_policy(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                                 text: str, source: str) -> bool:
-    """Delete prohibited content, escalate strikes, ban repeat offenders."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    cfg, db = state(context)
-    matcher: KeywordMatcher = context.application.bot_data["matcher"]
-    hit = matcher.find(text)
-    if not hit:
-        return False
-    bot = bot_of(context)
-    await safe_delete(bot, chat.id, message.message_id)
-    strikes = await db.run(db.add_content_strike, chat.id, user.id)
-    detail = "text" if source == "text" else f"{source} content"
-    if strikes >= cfg.content_ban_threshold:
-        try:
-            await bot.ban_chat_member(chat.id, user.id)
-            await db.run(db.add_ban, chat.id, user.id, user.full_name or "",
-                         f"prohibited content ({hit})", 0)
-            await db.run(db.reset_content_strikes, chat.id, user.id)
-            tail = (f"⛔ {mention(user.id, user.full_name)} was <b>banned</b> as a repeat "
-                    f"offender ({strikes}/{cfg.content_ban_threshold} strikes).")
-        except TelegramError as exc:
-            logger.warning("Repeat-offender ban failed: %s", exc)
-            tail = f"⚠️ Strike limit reached, but the ban failed ({esc(exc)})."
-    else:
-        tail = (f"⚠️ {mention(user.id, user.full_name)}: prohibited {detail} removed. "
-                f"Strike <b>{strikes}/{cfg.content_ban_threshold}</b>.")
-    await temp_reply(bot, chat.id, tail, delay=12, application=context.application)
-    logger.info("content hit=%s source=%s chat=%s user=%s strikes=%d",
-                hit, source, chat.id, user.id, strikes)
-    return True
-
-
-def image_candidate(message: Any) -> Optional[tuple[str, int]]:
-    """Return (file_id, size) for photos and image documents, else None."""
-    if message.photo:
-        photo = message.photo[-1]  # largest available variant
-        return photo.file_id, int(photo.file_size or 0)
-    doc = getattr(message, "document", None)
-    if doc and (getattr(doc, "mime_type", "") or "").startswith("image/"):
-        return doc.file_id, int(doc.file_size or 0)
-    return None
-
-
-def run_ocr(raw: bytes, lang: str) -> str:
-    """CPU-bound Tesseract call - always invoked via asyncio.to_thread."""
-    if not OCR_AVAILABLE or Image is None or pytesseract is None:
-        return ""
-    try:
-        with Image.open(BytesIO(raw)) as image:
-            image = image.convert("L")
-            if max(image.size) > 1600:
-                image.thumbnail((1600, 1600))
-            return pytesseract.image_to_string(image, lang=lang, config="--psm 6") or ""
-    except (UnidentifiedImageError, OSError) as exc:
-        logger.debug("Image could not be decoded: %s", exc)
-    except Exception as exc:  # TesseractError, missing language data, etc.
-        logger.warning("OCR failed: %s", exc)
-    return ""
-
-
-async def scan_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
-    cfg = state(context)[0]
-    candidate = image_candidate(update.effective_message)
-    if not candidate:
-        return ""
-    file_id, size = candidate
-    if size and size > cfg.ocr_max_bytes:
-        logger.debug("Skipping OCR for oversized image (%d bytes)", size)
-        return ""
-    if not OCR_AVAILABLE:
-        return ""
-    try:
-        tg_file = await bot_of(context).get_file(file_id)
-        raw = bytes(await tg_file.download_as_bytearray())
-    except TelegramError as exc:
-        logger.warning("Could not download image for OCR: %s", exc)
-        return ""
-    return await asyncio.to_thread(run_ocr, raw, cfg.ocr_lang)
-
-
-async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Final group handler: link policy -> keyword filter -> OCR safeguard."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or not user or user.is_bot:
-        return
-    bot = bot_of(context)
-    cfg, _ = state(context)
-    privileged = await is_privileged(bot, chat.id, user.id, cfg)
-    if not privileged and await enforce_link_policy(update, context, privileged):
-        return  # message deleted; no reason to OCR it
-    text = message.text or message.caption or ""
-    ocr_text = ""
-    if not privileged and image_candidate(message):
-        ocr_text = await scan_image(update, context)
-        if ocr_text:
-            logger.debug("OCR extracted %d chars in chat %s", len(ocr_text), chat.id)
-    if not privileged and await enforce_content_policy(
-        update, context, f"{text}\n{ocr_text}", "image" if ocr_text else "text"
-    ):
         return
 
-
-# --------------------------------------------------------------------------- #
-# 3. Throttled @all / @admin broadcasts                                        #
-# --------------------------------------------------------------------------- #
-
-def chunks(items: list[Any], size: int) -> Iterable[list[Any]]:
-    for index in range(0, len(items), max(1, size)):
-        yield items[index:index + max(1, size)]
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """/cancel: stop the mention run in progress in this chat (admins only)."""
-    chat, user, message = update.effective_chat, update.effective_user, update.effective_message
-    cfg, _ = state(context)
-    if not await is_privileged(bot_of(context), chat.id, user.id, cfg):
-        await message.reply_text("🔒 Only admins can cancel a mention run.")
+    # 1) Global banned-word vault (instant sync)
+    matched = await db.is_global_banned(text)
+    if matched:
+        await do_illegal_action(update, context, reason=f"banned word: {matched}")
         return
-    cancel = BROADCAST_CANCEL.get(chat.id)
-    if cancel is None or cancel.is_set():
-        await message.reply_text("There is no mention run in progress.")
-        return
-    cancel.set()  # the loop wakes up at once and reports how far it got
-    await message.reply_text("🛑 Stopping the mention run…")
 
-
-async def send_mention_batch(bot, chat_id: int, members: list[dict]) -> None:
-    """One HTML message containing one or more clickable user mentions."""
-    text = " ".join(
-        mention(int(m["user_id"]), m.get("name") or m.get("username") or str(m["user_id"]))
-        for m in members
-    )
-    for attempt in range(3):
-        try:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+    # 2) OCR blacklist text scan (also covers illegal text)
+    low = text.lower()
+    for bad in OCR_BLACKLIST:
+        if bad.lower() in low:
+            await do_illegal_action(update, context, reason=f"blacklist: {bad}")
             return
-        except RetryAfter as exc:
-            # Telegram asked us explicitly to slow down: obey the flood-wait.
-            wait = exc.retry_after  # int seconds, or a timedelta on newer releases
-            wait = wait.total_seconds() if hasattr(wait, "total_seconds") else float(wait)
-            await asyncio.sleep(wait + 1.0)
-        except (BadRequest, Forbidden, TelegramError) as exc:
-            logger.warning("Mention batch failed in %s: %s", chat_id, exc)
-            return
-    logger.warning("Giving up on a mention batch in %s after flood retries", chat_id)
 
-
-async def on_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Entry point for @all, @admin and /mentionall.
-
-    A paced run over every member can take many minutes, so it runs as a
-    background task: captcha buttons and moderation stay responsive meanwhile.
-    """
-    async def job() -> None:
+    # 3) Anti-link
+    if settings.get("antilink") and LINK_RE.search(text):
         try:
-            await run_broadcast(update, context)
-        except ApplicationHandlerStop:
-            pass  # run_broadcast uses it as its early-exit signal
-        except Exception:  # a background task must never die silently
-            logger.exception("Broadcast failed in chat %s", update.effective_chat.id)
+            await msg.delete()
+        except Exception:
+            pass
+        await send_temp_notice(context, chat_id, f"🔗 Links are not allowed here, {esc(update.effective_user.full_name)}.")
+        return
 
-    spawn(job(), context.application)
-    raise ApplicationHandlerStop  # the safeguard layer must not re-read this text
-
-
-async def run_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """@all [message] / @admin [message] - admin only, paced by asyncio.sleep(3)."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    match = BROADCAST_RE.match(message.text or "")
-    if not match:
-        raise ApplicationHandlerStop
-    mode = (match.group(1) or "all").lower()  # /mentionall behaves like @all
-    note = (match.group(2) or "").strip()
-    cfg, db = state(context)
-    bot = bot_of(context)
-    application = context.application
-
-    if not await is_privileged(bot, chat.id, user.id, cfg):
-        await safe_delete(bot, chat.id, message.message_id)
-        await temp_reply(bot, chat.id,
-                         f"🔒 {mention(user.id, user.full_name)}, mass mentions are admin-only.",
-                         delay=8, application=application)
-        raise ApplicationHandlerStop
-
-    lock = BROADCAST_LOCKS.setdefault(chat.id, asyncio.Lock())
-    if lock.locked():
-        await temp_reply(bot, chat.id, "⏳ A mention run is already in progress. Use /cancel to stop it.",
-                         delay=6, application=application)
-        raise ApplicationHandlerStop
-    now = time.monotonic()
-    last = BROADCAST_LAST.get(chat.id)
-    # "last is None" matters: monotonic() starts near zero on a freshly booted
-    # machine, so a 0.0 default would wrongly block the first run after boot.
-    elapsed = cfg.broadcast_cooldown if last is None else now - last
-    if elapsed < cfg.broadcast_cooldown:
-        await temp_reply(bot, chat.id,
-                         f"⏳ Please wait <b>{int(cfg.broadcast_cooldown - elapsed)}s</b> "
-                         "before another broadcast.", delay=6, application=application)
-        raise ApplicationHandlerStop
-
-    async with lock:
-        if mode == "admin":
-            try:
-                admins = await bot.get_chat_administrators(chat.id)
-            except TelegramError as exc:
-                await temp_reply(bot, chat.id, f"Could not read admin list: {esc(exc)}",
-                                 delay=8, application=application)
-                raise ApplicationHandlerStop
-            targets = [
-                {"user_id": a.user.id, "name": a.user.full_name, "username": a.user.username or ""}
-                for a in admins if a.user and not a.user.is_bot
-            ]
-            label = "administrators"
-        else:
-            # Every known human member, active or not. Bots are never included.
-            try:
-                for admin in await bot.get_chat_administrators(chat.id):
-                    if admin.user and not admin.user.is_bot:
-                        await db.run(db.touch_activity, chat.id, admin.user)
-            except TelegramError as exc:
-                logger.debug("Could not seed admins into the roster: %s", exc)
-            targets = await db.run(db.all_members, chat.id, cfg.max_mentions)
-            label = "members"
-
-        if not targets:
-            await temp_reply(bot, chat.id,
-                             "No eligible members found yet. The activity table fills as people chat.",
-                             delay=10, application=application)
-            raise ApplicationHandlerStop
-
-        header = (f"📢 <b>Announcement from {mention(user.id, user.full_name)}</b>\n"
-                  f"{esc(note) if note else '(no message attached)'}\n"
-                  f"<i>Tagging {len(targets)} {label} — paced at {cfg.mention_delay:g}s. "
-                  "Admins can stop it with /cancel.</i>")
-        await bot.send_message(chat_id=chat.id, text=header, parse_mode=ParseMode.HTML)
-
-        BROADCAST_LAST[chat.id] = now  # the cooldown starts only when a run really begins
-        cancel = BROADCAST_CANCEL[chat.id] = asyncio.Event()
-        batches = list(chunks(targets, cfg.mention_batch_size))
-        done = 0
+    # 4) Anti-spam (repetitive / flood)
+    if settings.get("antispam") and SPAM_RE.search(text):
         try:
-            for index, batch in enumerate(batches):
-                if cancel.is_set():
-                    break
-                await send_mention_batch(bot, chat.id, batch)
-                done += len(batch)
-                if index < len(batches) - 1:
-                    # The safe interval that prevents Telegram flood-wait errors.
-                    # Same pacing as asyncio.sleep(cfg.mention_delay), but it
-                    # wakes up immediately when an admin sends /cancel.
-                    try:
-                        await asyncio.wait_for(cancel.wait(), timeout=cfg.mention_delay)
-                    except asyncio.TimeoutError:
-                        pass
-        finally:
-            BROADCAST_CANCEL.pop(chat.id, None)
-        if cancel.is_set():
-            BROADCAST_LAST.pop(chat.id, None)  # a cancelled run does not use up the cooldown
-            summary = f"🛑 Mention run cancelled after {done} of {len(targets)} {label}."
-        else:
-            summary = f"✅ Finished: mentioned {done} {label}."
+            await msg.delete()
+        except Exception:
+            pass
+        await send_temp_notice(context, chat_id, f"🚫 Spam detected and removed.")
+        return
+
+async def do_illegal_action(update: Update, context: ContextTypes.DEFAULT_TYPE, reason: str = ""):
+    """Delete offending message + send illegal notice then auto-delete notice."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    log.warning("ILLEGAL trigger in %s from %s: %s | %s", chat.id, update.effective_user.id if update.effective_user else "?", reason, (msg.text or msg.caption or "[media]")[:120])
+    try:
+        await msg.delete()
+    except (BadRequest, Forbidden):
+        # fallback: try via API
         try:
-            await bot.send_message(chat_id=chat.id, text=summary)
-        except TelegramError as exc:
-            logger.debug("Could not post the mention summary: %s", exc)
-        logger.info("broadcast mode=%s chat=%s done=%d/%d cancelled=%s",
-                    mode, chat.id, done, len(targets), cancel.is_set())
-    raise ApplicationHandlerStop  # never let the safeguard layer re-read this text
-
-
-# --------------------------------------------------------------------------- #
-# 4. Captcha verification on join                                              #
-# --------------------------------------------------------------------------- #
-
-def memberish(member: Any) -> bool:
-    status = member.status
-    if status in (ST_MEMBER, ST_ADMIN, ST_OWNER):
-        return True
-    return status == ST_RESTRICTED and bool(getattr(member, "is_member", False))
-
-
-async def captcha_timeout(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Kick a user who never pressed the button (JobQueue or fallback task)."""
-    job = getattr(context, "job", None)
-    payload = getattr(job, "data", None) or getattr(context, "data", {}) or {}
-    chat_id, user_id, token = payload.get("chat_id"), payload.get("user_id"), payload.get("token")
-    application = context.application
-    bot, db = application.bot, application.bot_data["db"]
-    if chat_id is None or user_id is None or not token:
-        return
-    row = await db.run(db.get_captcha, chat_id, user_id)
-    if not row or row["token"] != token:
-        return  # Already verified, re-joined, or manually handled.
-    try:
-        await kick_user(bot, chat_id, user_id)
-        await db.run(db.finish_captcha, chat_id, user_id)
-        await safe_delete(bot, chat_id, int(row["message_id"]))
-        await temp_reply(bot, chat_id,
-                         f"⏳ {mention(user_id, row['display_name'])} was removed: "
-                         "captcha not completed in time.", delay=15, application=application)
-        logger.info("captcha timeout kick chat=%s user=%s", chat_id, user_id)
-    except (Forbidden, BadRequest) as exc:
-        logger.warning("Captcha kick failed (missing ban rights?) chat=%s: %s", chat_id, exc)
-    except TelegramError as exc:
-        logger.warning("Captcha cleanup failed: %s", exc)
-
-
-def schedule_captcha_timeout(application: Application, chat_id: int, user_id: int,
-                             token: str, delay: float) -> None:
-    payload = {"chat_id": chat_id, "user_id": user_id, "token": token}
-    name = f"captcha:{chat_id}:{user_id}"
-    if application.job_queue:
-        for existing in application.job_queue.get_jobs_by_name(name):
-            existing.schedule_removal()
-        application.job_queue.run_once(
-            captcha_timeout, when=timedelta(seconds=max(1.0, delay)),
-            data=payload, name=name,
-        )
-    else:
-        # APScheduler extra not installed: fall back to a plain asyncio task.
-        async def fallback() -> None:
-            await asyncio.sleep(max(1.0, delay))
-            fake = SimpleNamespace(
-                application=application,
-                job=SimpleNamespace(data=payload),
-                data=payload,
-            )
-            await captcha_timeout(fake)  # type: ignore[arg-type]
-        spawn(fallback(), application)
-
-
-async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Restrict new joiners and send the inline verification button."""
-    change = update.chat_member
-    if not change or not change.new_chat_member:
-        return
-    old, new = change.old_chat_member, change.new_chat_member
-    if await track_membership(change, context):
-        return  # departure, ban sync or owner join: no captcha needed
-    if memberish(old) or not memberish(new):
-        return
-    user, chat = new.user, change.chat
-    if user.is_bot or user.id in state(context)[0].owner_ids:
-        return
-    bot = bot_of(context)
-    cfg, db = state(context)
-    try:
-        await bot.restrict_chat_member(chat_id=chat.id, user_id=user.id,
-                                       permissions=ChatPermissions.no_permissions())
-    except (Forbidden, BadRequest) as exc:
-        logger.warning("Cannot restrict new member %s in %s: %s", user.id, chat.id, exc)
-        await temp_reply(bot, chat.id,
-                         "⚠️ I need the <b>Restrict members</b> right (and a supergroup) "
-                         "to run captcha verification.", delay=20, application=context.application)
-        return
-    token = secrets.token_urlsafe(6)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Click here to prove you're human",
-                             callback_data=f"cv:{chat.id}:{user.id}:{token}")
-    ]])
-    welcome_text = (
-        f"🔐 {mention(user.id, user.first_name or user.full_name)}, one quick check first.\n\n"
-        "To keep this group spam-free, please confirm you're human by pressing "
-        f"the button below within <b>{cfg.captcha_timeout // 60} minute(s)</b>. "
-        "You can't post messages until you do."
-    )
-    try:
-        sent = await bot.send_message(chat_id=chat.id, text=welcome_text,
-                                      parse_mode=ParseMode.HTML, reply_markup=keyboard)
-    except TelegramError as exc:
-        logger.warning("Could not send captcha message: %s", exc)
-        return
-    await db.run(db.save_captcha, chat.id, user.id, token, sent.message_id, user.full_name or "")
-    schedule_captcha_timeout(context.application, chat.id, user.id, token, float(cfg.captcha_timeout))
-    logger.info("captcha sent chat=%s user=%s", chat.id, user.id)
-
-
-async def on_captcha_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    if not query or not query.data:
-        return
-    match = CAPTCHA_RE.match(query.data)
-    if not match:
-        await query.answer("Invalid verification token.", show_alert=True)
-        return
-    chat_id, target_id, token = int(match.group(1)), int(match.group(2)), match.group(3)
-    if query.from_user.id != target_id:
-        await query.answer("This button isn't for you 🙂", show_alert=True)
-        return
-    bot = bot_of(context)
-    _, db = state(context)
-    row = await db.run(db.get_captcha, chat_id, target_id)
-    if not row or row["token"] != token:
-        await query.answer("This verification expired or was already used.", show_alert=True)
-        return
-    try:
-        await bot.restrict_chat_member(chat_id=chat_id, user_id=target_id,
-                                       permissions=await default_permissions(bot, chat_id))
-    except TelegramError as exc:
-        logger.warning("Could not restore permissions after captcha: %s", exc)
-        await query.answer("I need Restrict members rights — please tell an admin.", show_alert=True)
-        return
-    await db.run(db.finish_captcha, chat_id, target_id)
-    if context.application.job_queue:
-        for job in context.application.job_queue.get_jobs_by_name(f"captcha:{chat_id}:{target_id}"):
-            job.schedule_removal()
-    await query.answer("✅ Verified — welcome to the group!")
-    try:
-        await bot.edit_message_text(
-            chat_id=chat_id, message_id=int(row["message_id"]),
-            text=f"✅ {mention(target_id, query.from_user.full_name)} is verified. Welcome!",
-            parse_mode=ParseMode.HTML,
-        )
-    except TelegramError:
+            await context.bot.delete_message(chat.id, msg.message_id)
+        except Exception:
+            pass
+    except Exception:
         pass
-    logger.info("captcha verified chat=%s user=%s", chat_id, target_id)
-    # Captcha passed: tidy up the prompt, then send the real welcome (text + photo).
-    spawn(delete_later(bot, chat_id, int(row["message_id"]), 10), context.application)
-    title = getattr(getattr(query.message, "chat", None), "title", None) or "the group"
-    await send_greeting(bot, db, chat_id, title, query.from_user, "welcome")
+    # temporary notice (must read exactly: "I found something illegal so I deleted it")
+    await send_temp_notice(context, chat.id, ILLEGAL_NOTICE, ttl=ILLEGAL_NOTICE_TTL)
 
-
-# --------------------------------------------------------------------------- #
-# 5. Shadow-reply / proxy messaging                                            #
-# --------------------------------------------------------------------------- #
-
-async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Delete the admin's command and republish the payload as the bot itself."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not await require_admin(update, context, "use shadow replies"):
-        return
-    raw_html = getattr(message, "text_html", None) or esc(message.text or "")
-    # Strip only the leading command (including an optional @BotUsername).
-    payload = re.sub(r"^/shadowreply(?:@\w+)?\s*", "", raw_html, count=1,
-                     flags=re.IGNORECASE).strip()
-    if not payload:
-        await message.reply_text("Usage: <code>/shadowreply Your announcement text</code>",
-                                 parse_mode=ParseMode.HTML)
-        return
-    last = SHADOW_LAST.get(user.id, 0.0)
-    if time.monotonic() - last < 2.0:
-        await message.reply_text("⏳ Please wait a moment before another shadow reply.")
-        return
-    SHADOW_LAST[user.id] = time.monotonic()
-    bot = bot_of(context)
-    await safe_delete(bot, chat.id, message.message_id)
-    try:
-        # Sent by the bot's own identity: the original admin is not the author.
-        await bot.send_message(chat_id=chat.id, text=payload, parse_mode=ParseMode.HTML)
-    except BadRequest:
-        # Fallback for exotic entity combinations: resend as plain text.
-        await bot.send_message(chat_id=chat.id, text=command_payload(message))
-    logger.info("shadow reply chat=%s by=%s", chat.id, user.id)
-
-
-# --------------------------------------------------------------------------- #
-# 6. Word jumble / Wordle-style game                                           #
-# --------------------------------------------------------------------------- #
-
-EXACT_ICON, MISPLACED_ICON, MISSING_ICON = "🎯", "🔀", "🚫"
-HINT_LEGEND = (f"{EXACT_ICON} right letter &amp; spot · "
-               f"{MISPLACED_ICON} right letter, wrong spot · "
-               f"{MISSING_ICON} not in the word")
-
-
-def score_guess(guess: str, answer: str) -> str:
-    """Two-pass Wordle scoring with correct duplicate-letter handling."""
-    length = len(answer)
-    result = [MISSING_ICON] * length
-    remaining: Counter = Counter()
-    for index, (letter, target) in enumerate(zip(guess, answer)):
-        if letter == target:
-            result[index] = EXACT_ICON
-        else:
-            remaining[target] += 1
-    for index, letter in enumerate(guess):
-        if result[index] == EXACT_ICON:
-            continue
-        if remaining[letter] > 0:
-            result[index] = MISPLACED_ICON
-            remaining[letter] -= 1
-    return "".join(result)
-
-
-async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message, chat = update.effective_message, update.effective_chat
-    command = (message.text or "").split()[0].lstrip("/").split("@")[0].lower()
-    match = re.fullmatch(r"new(\d)?", command)
-    length = int(match.group(1)) if match and match.group(1) else 5
-    bank: dict[int, tuple[str, ...]] = context.application.bot_data["words"]
-    words = bank.get(length)
-    if not words:
-        await message.reply_text(
-            f"No {length}-letter words available. Try: " +
-            ", ".join(f"/new{n}" for n in sorted(bank)) + " or /new.")
-        return
-    cfg, db = state(context)
-    word = secrets.choice(words)
-    await db.run(db.start_game, chat.id, word, length, update.effective_user.id)
-    await message.reply_text(
-        f"🎲 <b>New {length}-letter word game!</b>\n"
-        f"Send a {length}-letter word as a plain message to guess. "
-        f"Up to <b>{cfg.max_guesses}</b> guesses — first correct guess wins.\n\n{HINT_LEGEND}",
-        parse_mode=ParseMode.HTML)
-
-
-async def on_guess(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Consume a valid bare-word guess before the safeguard layer sees it."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not message.text or message.text.startswith("/") or not user or user.is_bot:
-        return
-    cfg, db = state(context)
-    game = await db.run(db.get_game, chat.id)
-    if not game or game["status"] != "active":
-        return
-    guess = message.text.strip().lower()
-    if not re.fullmatch(r"[a-z]+", guess) or len(guess) != int(game["length"]):
-        return  # ordinary chat, let later groups process it
-    hint = score_guess(guess, str(game["word"]))
-    entry = {"g": guess, "u": user.id, "n": user.full_name, "h": hint, "at": time.time()}
-    count = await db.run(db.append_guess, chat.id, entry)
-    if count is None:
-        return
-    who = mention(user.id, user.full_name)
-    answer = str(game["word"])
-    if guess == answer:
-        await db.run(db.finish_game, chat.id, "won")
-        total = await db.run(db.record_win, chat.id, user.id, user.full_name or "")
-        await message.reply_text(
-            f"🏆 {who} solved it in <b>{count}</b> guess(es)!\n"
-            f"<code>{guess.upper()}  {hint}</code>\n"
-            f"The word was <b>{esc(answer.upper())}</b> · career wins: {total}.\n"
-            "Start another round with /new.", parse_mode=ParseMode.HTML)
-    elif count >= cfg.max_guesses:
-        await db.run(db.finish_game, chat.id, "exhausted")
-        await message.reply_text(
-            f"🛑 <b>{cfg.max_guesses} guesses used — game over!</b>\n"
-            f"<code>{guess.upper()}  {hint}</code>\n"
-            f"The word was <b>{esc(answer.upper())}</b>. Use /new to retry.",
-            parse_mode=ParseMode.HTML)
-    else:
-        await message.reply_text(
-            f"<code>{guess.upper()}  {hint}</code>\n"
-            f"<i>Guess {count}/{cfg.max_guesses} · {HINT_LEGEND}</i>",
-            parse_mode=ParseMode.HTML)
-    raise ApplicationHandlerStop
-
-
-async def cmd_game(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    cfg, db = state(context)
-    game = await db.run(db.get_game, update.effective_chat.id)
-    if not game or game["status"] != "active":
-        await update.effective_message.reply_text("No active game. Start one with /new, /new4, /new5 or /new6.")
-        return
-    guesses = json.loads(game["guesses"] or "[]")
-    history = "\n".join(f"<code>{esc(g['g'].upper())}  {g['h']}</code>" for g in guesses[-6:])
-    await update.effective_message.reply_text(
-        f"🎯 <b>Active {game['length']}-letter game</b> · "
-        f"{len(guesses)}/{cfg.max_guesses} guesses used.\n"
-        f"{history or '<i>No guesses yet.</i>'}\n{HINT_LEGEND}", parse_mode=ParseMode.HTML)
-
-
-async def cmd_stopgame(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context, "stop games"):
-        return
-    _, db = state(context)
-    game = await db.run(db.get_game, update.effective_chat.id)
-    if not game or game["status"] != "active":
-        await update.effective_message.reply_text("There is no active game.")
-        return
-    await db.run(db.finish_game, update.effective_chat.id, "stopped")
-    await update.effective_message.reply_text(
-        f"🛑 Game stopped. The word was <b>{esc(str(game['word']).upper())}</b>.",
-        parse_mode=ParseMode.HTML)
-
-
-async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, db = state(context)
-    rows = await db.run(db.leaderboard, update.effective_chat.id, 5)
-    if not rows:
-        await update.effective_message.reply_text("No winners yet. Start a game with /new!")
-        return
-    lines = [f"{i}. {mention(int(r['user_id']), r['name'])} — <b>{r['wins']}</b> win(s)"
-             for i, r in enumerate(rows, 1)]
-    await update.effective_message.reply_text("🏅 <b>Top guessers</b>\n" + "\n".join(lines),
-                                              parse_mode=ParseMode.HTML)
-
-
-# --------------------------------------------------------------------------- #
-# Utility commands + lifecycle                                                 #
-# --------------------------------------------------------------------------- #
-
-HELP_TEXT = """<b>Miss Sona — command list</b>
-
-<b>Moderation (admin)</b>
-/ban /unban /kick /mute /unmute /warn /warns /banned
-Needs the group owner or an admin with the “Ban users” right.
-/trust /untrust — link exemptions (any admin)
-
-<b>Welcome &amp; goodbye</b> (owner or “Change group info” admins)
-/welcome /setwelcome /rmwelcome · /welcome on|off
-/goodbye /setgoodbye /rmgoodbye · /goodbye on|off
-Placeholders: {first} {last} {fullname} {username} {mention} {id} {group} {count}
-Reply to a photo with /setwelcome to attach it.
-
-<b>Manage from private chat</b>
-/connect in the group, then use the commands above in my PM.
-/connection /disconnect
-
-<b>Mention everyone</b> (admin)
-/mentionall [message] — same as @all, bots are skipped
-/cancel — stop a mention run that is in progress
-
-<b>Rules &amp; notes</b>
-/setrules /rules /setnote /note /notes /delnote
-
-<b>Announcements</b>
-/shadowreply &lt;text&gt; — repost as the bot (admin/owner)
-@all [message] / @admin [message] — paced mentions (admin)
-
-<b>Game</b>
-/new /new4 /new5 /new6 /game /stopgame /top
-Send a plain word of the right length to guess.
-🎯 exact · 🔀 wrong spot · 🚫 absent
-
-<b>Info</b>
-/start /help /ping /id
-
-New members must complete the 2-minute captcha. Unapproved links and
-prohibited text (including text inside images) are removed automatically."""
-
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args or []
-    # Deep link from the /connect button: t.me/<bot>?start=connect_<chat_id>
-    if (args and args[0].startswith("connect_")
-            and update.effective_chat.type == ChatType.PRIVATE
-            and args[0][8:].lstrip("-").isdigit()):
-        _, db = state(context)
-        title = await connect_user(bot_of(context), db, update.effective_user.id, int(args[0][8:]))
-        await update.effective_message.reply_text(
-            CONNECTED_TEXT.format(title=esc(title)) if title else
-            "🔒 You need the “Change group info” right in that group to connect it.",
-            parse_mode=ParseMode.HTML)
-        return
-    await update.effective_message.reply_text(
-        "👋 <b>Miss Sona online.</b>\nI handle moderation, rules, notes, anti-spam, "
-        "captcha, broadcasts and word games.\nUse /help for the full command list.",
-        parse_mode=ParseMode.HTML)
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML)
-
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    _, db = state(context)
-    stats = await db.run(db.dashboard, update.effective_chat.id)
-    await update.effective_message.reply_text(
-        "🏓 <b>pong</b> — polling, database and handlers healthy.\n"
-        f"<i>{stats['notes']} notes · {stats['warned']} warned users · "
-        f"{stats['active']} tracked members</i>", parse_mode=ParseMode.HTML)
-
-
-async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat, user = update.effective_chat, update.effective_user
-    await update.effective_message.reply_text(
-        f"🆔 <b>Chat:</b> <code>{chat.id}</code> ({esc(chat.type)})\n"
-        f"<b>You:</b> <code>{user.id}</code> ({esc(user.full_name)})",
-        parse_mode=ParseMode.HTML)
-
-
-async def on_any_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Group -10: track activity and enforce the unverified-user message gate."""
-    message, chat, user = update.effective_message, update.effective_chat, update.effective_user
-    if not message or not chat or not user or user.is_bot:
-        return
-    cfg, db = state(context)
-    await db.run(db.touch_activity, chat.id, user)
-    # A restricted user should not be able to post; this is a defensive fallback.
-    pending = await db.run(db.get_captcha, chat.id, user.id)
-    if pending:
-        await safe_delete(bot_of(context), chat.id, message.message_id)
-        raise ApplicationHandlerStop
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    err = context.error
-    if isinstance(err, (NetworkError, RetryAfter)):
-        logger.warning("Transient Telegram network issue: %s", err)
-        return
-    logger.error("Unhandled exception while processing an update",
-                 exc_info=(type(err), err, getattr(err, "__traceback__", None)))
-    cfg = context.application.bot_data.get("cfg")
-    if cfg and cfg.error_chat_id:
+# — OCR pipeline for photos/documents —
+async def ocr_inspect_image_bytes(image_bytes: bytes) -> str:
+    """Run OCR in thread; return extracted text (lowercased). Graceful fallback if deps missing."""
+    if not PIL_AVAILABLE or not TESS_AVAILABLE:
+        return ""
+    def _ocr() -> str:
         try:
-            text = f"⚠️ <b>Miss Sona error</b>\n<code>{esc(str(err))[:800]}</code>"
-            await context.application.bot.send_message(cfg.error_chat_id, text,
-                                                       parse_mode=ParseMode.HTML)
-        except TelegramError:
+            img = Image.open(io.BytesIO(image_bytes))
+            # preprocess: convert to grayscale for better OCR
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            # optional resize: limit max dimension to 2000 to avoid huge images
+            max_dim = 2000
+            if max(img.size) > max_dim:
+                ratio = max_dim / max(img.size)
+                new_size = (int(img.size[0]*ratio), int(img.size[1]*ratio))
+                # Pillow >=10 uses Resampling
+                try:
+                    img = img.resize(new_size, Image.Resampling.LANCZOS)  # type: ignore
+                except AttributeError:
+                    img = img.resize(new_size, Image.LANCZOS)  # type: ignore
+            text = pytesseract.image_to_string(img)  # type: ignore
+            return text or ""
+        except Exception as e:
+            log.debug("OCR error: %s", e)
+            return ""
+    return await asyncio.to_thread(_ocr)
+
+async def handle_photo_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group 0: OCR scan for photos & image documents."""
+    msg = update.effective_message
+    if not msg or not update.effective_chat or update.effective_chat.type == "private":
+        return
+    if await check_bypass(update, context):
+        return
+    chat_id = update.effective_chat.id
+    settings = await db.get_settings(chat_id)
+    if not settings.get("ocr_protection"):
+        return
+
+    file_obj = None
+    # photo
+    if msg.photo:
+        file_obj = msg.photo[-1].get_file  # will call later
+        try:
+            tg_file = await context.bot.get_file(msg.photo[-1].file_id)
+        except Exception:
+            return
+        # file size guard: skip >20MB
+        if tg_file.file_size and tg_file.file_size > 20 * 1024 * 1024:
+            return
+        try:
+            bio = io.BytesIO()
+            await tg_file.download_to_memory(bio)
+            data = bio.getvalue()
+        except Exception as e:
+            log.debug("download failed: %s", e)
+            return
+    elif msg.document and msg.document.mime_type and msg.document.mime_type.startswith("image/"):
+        try:
+            tg_file = await context.bot.get_file(msg.document.file_id)
+        except Exception:
+            return
+        if tg_file.file_size and tg_file.file_size > 20 * 1024 * 1024:
+            return
+        try:
+            bio = io.BytesIO()
+            await tg_file.download_to_memory(bio)
+            data = bio.getvalue()
+        except Exception:
+            return
+    else:
+        return
+
+    # Run OCR
+    extracted = await ocr_inspect_image_bytes(data)
+    if not extracted.strip():
+        return
+    low = extracted.lower()
+    # Check against global banned vault + blacklist
+    matched_global = await db.is_global_banned(low)
+    if matched_global:
+        await do_illegal_action(update, context, reason=f"OCR global match: {matched_global} | {low[:80]}")
+        return
+    for bad in OCR_BLACKLIST:
+        if bad.lower() in low:
+            await do_illegal_action(update, context, reason=f"OCR blacklist: {bad}")
+            return
+    # Optional: if no deps, we still block obviously named illegal files via filename
+    # (handled by text scan already via caption)
+
+# ──────────────────────────────────────────
+# Locks admin commands (granular toggles)
+# ──────────────────────────────────────────
+@admin_required
+async def cmd_locks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    s = await db.get_settings(chat.id)
+    kb = [
+        [
+            InlineKeyboardButton(f"{'✅' if s['antilink'] else '❌'} Anti-Link", callback_data="toggle_antilink"),
+            InlineKeyboardButton(f"{'✅' if s['antispam'] else '❌'} Anti-Spam", callback_data="toggle_antispam"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✅' if s['ocr_protection'] else '❌'} OCR Shield", callback_data="toggle_ocr_protection"),
+            InlineKeyboardButton(f"{'✅' if s['captcha_enabled'] else '❌'} CAPTCHA Gate", callback_data="toggle_captcha_enabled"),
+        ],
+        [InlineKeyboardButton("Close", callback_data="close_locks")],
+    ]
+    await update.effective_message.reply_html(
+        f"🔐 <b>Protection Panel — {esc(chat.title or '')}</b>\n"
+        f"Anti-Link: {'ON' if s['antilink'] else 'OFF'}\n"
+        f"Anti-Spam: {'ON' if s['antispam'] else 'OFF'}\n"
+        f"OCR Shield: {'ON' if s['ocr_protection'] else 'OFF'}\n"
+        f"CAPTCHA Gate: {'ON' if s['captcha_enabled'] else 'OFF'}\n\n"
+        "Tap to toggle. Trusted users & admins bypass all locks.",
+        reply_markup=InlineKeyboardMarkup(kb),
+    )
+
+async def cb_toggle_locks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    await q.answer()
+    if q.data == "close_locks":
+        try:
+            await q.message.delete()
+        except Exception:
+            pass
+        return
+    if not q.data.startswith("toggle_"):
+        return
+    key = q.data.replace("toggle_", "")
+    if key not in DEFAULT_SETTINGS:
+        return
+    # admin check
+    if not await is_admin(update, context):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    chat_id = update.effective_chat.id  # type: ignore
+    cur = await db.get_settings(chat_id)
+    new_val = not cur.get(key, True)
+    await db.set_setting(chat_id, key, new_val)
+    # update keyboard
+    s = await db.get_settings(chat_id)
+    kb = [
+        [
+            InlineKeyboardButton(f"{'✅' if s['antilink'] else '❌'} Anti-Link", callback_data="toggle_antilink"),
+            InlineKeyboardButton(f"{'✅' if s['antispam'] else '❌'} Anti-Spam", callback_data="toggle_antispam"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✅' if s['ocr_protection'] else '❌'} OCR Shield", callback_data="toggle_ocr_protection"),
+            InlineKeyboardButton(f"{'✅' if s['captcha_enabled'] else '❌'} CAPTCHA Gate", callback_data="toggle_captcha_enabled"),
+        ],
+        [InlineKeyboardButton("Close", callback_data="close_locks")],
+    ]
+    try:
+        await q.edit_message_text(
+            f"🔐 <b>Protection Panel</b>\n"
+            f"Anti-Link: {'ON' if s['antilink'] else 'OFF'}\n"
+            f"Anti-Spam: {'ON' if s['antispam'] else 'OFF'}\n"
+            f"OCR Shield: {'ON' if s['ocr_protection'] else 'OFF'}\n"
+            f"CAPTCHA Gate: {'ON' if s['captcha_enabled'] else 'OFF'}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+    except BadRequest:
+        pass
+
+# ──────────────────────────────────────────
+# Activity tracking & CAPTCHA gate
+# ──────────────────────────────────────────
+async def track_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Group -1: always track active members."""
+    if not update.effective_chat or not update.effective_user:
+        return
+    if update.effective_user.is_bot:
+        return
+    chat = update.effective_chat
+    if chat.type == "private":
+        return
+    user = update.effective_user
+    try:
+        await db.upsert_active(chat.id, user.id, user.username, user.full_name)
+    except Exception as e:
+        log.debug("track_activity failed: %s", e)
+
+async def on_new_members(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gate new joiners with inline verification."""
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat or chat.type == "private":
+        return
+    if not msg.new_chat_members:
+        return
+    settings = await db.get_settings(chat.id)
+    if not settings.get("captcha_enabled"):
+        return
+    bot_id = context.bot.id
+    for member in msg.new_chat_members:
+        if member.is_bot:
+            continue
+        # Restrict immediately — cannot send messages/media
+        try:
+            await context.bot.restrict_chat_member(
+                chat.id, member.id,
+                permissions=ChatPermissions(can_send_messages=False, can_send_media_messages=False, can_send_other_messages=False, can_add_web_page_previews=False),
+            )
+        except (BadRequest, Forbidden) as e:
+            log.warning("CAPTCHA restrict failed (bot needs admin): %s", e)
+            continue
+
+        # Build verify button — callback contains user_id to prevent others verifying for them
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Verify You Are Human", callback_data=f"captcha_{member.id}")]])
+        try:
+            sent = await msg.reply_html(
+                f"👋 Welcome {mention_html(member.id, member.full_name)}!\n"
+                f"Please verify you are human within <b>{CAPTCHA_TIMEOUT//60} min</b> or you will be removed.\n"
+                f"<i>Only you can press the button.</i>",
+                reply_markup=kb,
+            )
+        except Exception as e:
+            log.debug("captcha send failed: %s", e)
+            continue
+
+        # Schedule ban on timeout via JobQueue or asyncio fallback
+        job_name = f"captcha_{chat.id}_{member.id}"
+        # cancel old if exists
+        old = pending_captcha.get((chat.id, member.id))
+        if old and hasattr(old, "schedule_removal"):
+            try:
+                old.schedule_removal()
+            except Exception:
+                pass
+
+        async def captcha_timeout_job(ctx: ContextTypes.DEFAULT_TYPE):
+            # called by JobQueue
+            data = ctx.job.data if ctx.job else {}
+            c_id = data.get("chat_id", chat.id)
+            u_id = data.get("user_id", member.id)
+            msg_id = data.get("msg_id", sent.message_id)
+            # still restricted? check status
+            try:
+                m = await ctx.bot.get_chat_member(c_id, u_id)
+                # if already unrestricted (verified), do nothing
+                # ChatMemberRestricted has can_send_messages False; if verified they have True via unrestrict
+                if m.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER):
+                    # need to check if they were unrestricted after verification — we'd have removed pending
+                    # if pending still exists, they didn't verify -> ban
+                    if (c_id, u_id) in pending_captcha:
+                        if CAPTCHA_BAN_ON_FAIL:
+                            try:
+                                await ctx.bot.ban_chat_member(c_id, u_id)
+                                await ctx.bot.unban_chat_member(c_id, u_id)  # kick, not permanent
+                                await ctx.bot.send_message(c_id, f"⏰ {mention_html(u_id, member.full_name)} failed verification and was removed.", parse_mode=ParseMode.HTML)
+                            except Exception:
+                                pass
+                        try:
+                            await ctx.bot.delete_message(c_id, msg_id)
+                        except Exception:
+                            pass
+                        pending_captcha.pop((c_id, u_id), None)
+                elif m.status == ChatMemberStatus.RESTRICTED:
+                    # still restricted -> timeout
+                    if (c_id, u_id) in pending_captcha:
+                        if CAPTCHA_BAN_ON_FAIL:
+                            try:
+                                await ctx.bot.ban_chat_member(c_id, u_id)
+                                await ctx.bot.unban_chat_member(c_id, u_id)
+                                await ctx.bot.send_message(c_id, f"⏰ {mention_html(u_id, member.full_name)} failed verification and was removed.", parse_mode=ParseMode.HTML)
+                            except Exception:
+                                pass
+                        try:
+                            await ctx.bot.delete_message(c_id, msg_id)
+                        except Exception:
+                            pass
+                        pending_captcha.pop((c_id, u_id), None)
+            except Exception as e:
+                log.debug("captcha timeout check failed: %s", e)
+
+        if context.job_queue:
+            job = context.job_queue.run_once(
+                captcha_timeout_job,
+                CAPTCHA_TIMEOUT,
+                data={"chat_id": chat.id, "user_id": member.id, "msg_id": sent.message_id},
+                name=job_name,
+            )
+            pending_captcha[(chat.id, member.id)] = job
+        else:
+            # asyncio fallback
+            async def _fallback():
+                await asyncio.sleep(CAPTCHA_TIMEOUT)
+                # emulate job
+                class _FakeJob:
+                    data = {"chat_id": chat.id, "user_id": member.id, "msg_id": sent.message_id}
+                    job = type("obj", (), {"data": data})()
+                class _FakeCtx:
+                    bot = context.bot
+                    job = _FakeJob.job
+                if (chat.id, member.id) in pending_captcha:
+                    await captcha_timeout_job(_FakeCtx())  # type: ignore
+            task = asyncio.create_task(_fallback())
+            pending_captcha[(chat.id, member.id)] = task
+
+async def cb_captcha_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not q or not q.data or not q.data.startswith("captcha_"):
+        return
+    try:
+        target_id = int(q.data.split("_")[1])
+    except Exception:
+        await q.answer("Invalid.", show_alert=True)
+        return
+    clicker = update.effective_user
+    if not clicker:
+        return
+    # Only the gated user themselves can verify (strict)
+    if clicker.id != target_id:
+        await q.answer("This button is not for you. Only the new member can verify.", show_alert=True)
+        return
+    chat = update.effective_chat
+    if not chat:
+        return
+    # Unrestrict
+    try:
+        perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True, can_send_other_messages=True, can_add_web_page_previews=True)
+        await context.bot.restrict_chat_member(chat.id, target_id, permissions=perms)
+    except Exception as e:
+        await q.answer(f"Failed: {e}", show_alert=True)
+        return
+    # Cancel timeout job
+    key = (chat.id, target_id)
+    job = pending_captcha.pop(key, None)
+    if job:
+        try:
+            if hasattr(job, "schedule_removal"):
+                job.schedule_removal()
+            else:
+                job.cancel()  # asyncio task
+        except Exception:
+            pass
+    try:
+        await q.edit_message_text(f"✅ Verified — welcome {esc(clicker.full_name)}! You can now chat.")
+    except Exception:
+        await q.answer("Verified — welcome!", show_alert=False)
+    else:
+        await q.answer("Verified!")
+
+# ──────────────────────────────────────────
+# Throttled Mass Mentions
+# ──────────────────────────────────────────
+@admin_required
+async def cmd_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tag active members in batches of 5 every 3s."""
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat:
+        return
+    custom_text = " ".join(context.args) if context.args else "Attention everyone!"
+    actives = await db.get_active_users(chat.id, limit=500)
+    # Filter out bots? DB already excludes bots via tracking
+    if not actives:
+        # fallback to admin list
+        await msg.reply_text("No active user pool yet. Chat a bit first so I can build the pool.")
+        return
+    # Exclude the command issuer? No, include.
+    await msg.reply_text(f"📢 Broadcasting to {len(actives)} active members in batches of {TAG_BATCH_SIZE}…")
+
+    # Pace batches
+    for i in range(0, len(actives), TAG_BATCH_SIZE):
+        batch = actives[i:i+TAG_BATCH_SIZE]
+        mentions = []
+        for uid, uname, fname in batch:
+            # Prefer username mention if available for client highlights, but use HTML mention for reliability
+            mentions.append(mention_html(uid, fname))
+        text = f"📣 <b>{esc(custom_text)}</b>\n\n" + " ".join(mentions)
+        # Optional payload: if command was reply, include replied message link? just text for now.
+        try:
+            await context.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("tagall batch failed: %s", e)
+            # flood wait handling: PTB handles RetryAfter automatically if using job queue? We'll sleep a bit longer
+            await asyncio.sleep(2)
+        if i + TAG_BATCH_SIZE < len(actives):
+            await asyncio.sleep(TAG_BATCH_DELAY)
+
+@admin_required
+async def cmd_admins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat:
+        return
+    custom_text = " ".join(context.args) if context.args else "Admins — please attend!"
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+    except Exception as e:
+        await msg.reply_text(f"Failed to fetch admins: {e}")
+        return
+    # Filter bots except we keep? skip bots
+    human_admins = [a for a in admins if not a.user.is_bot]
+    if not human_admins:
+        await msg.reply_text("No human admins found.")
+        return
+    await msg.reply_text(f"👮 Tagging {len(human_admins)} admins…")
+    # batch
+    admin_users = [(a.user.id, a.user.username, a.user.full_name) for a in human_admins]
+    for i in range(0, len(admin_users), TAG_BATCH_SIZE):
+        batch = admin_users[i:i+TAG_BATCH_SIZE]
+        mentions = [mention_html(uid, fname) for uid, _, fname in batch]
+        text = f"👮 <b>{esc(custom_text)}</b>\n\n" + " ".join(mentions)
+        try:
+            await context.bot.send_message(chat.id, text, parse_mode=ParseMode.HTML)
+        except Exception as e:
+            log.warning("admin tag failed: %s", e)
+        if i + TAG_BATCH_SIZE < len(admin_users):
+            await asyncio.sleep(TAG_BATCH_DELAY)
+
+# ──────────────────────────────────────────
+# Shadow-Reply (Anonymous Admin Sending)
+# ──────────────────────────────────────────
+@admin_required
+async def cmd_shadowreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    # payload is all args joined
+    payload = " ".join(context.args) if context.args else ""
+    # also handle reply mode: if no args but replying, take replied text
+    if not payload and msg.reply_to_message and (msg.reply_to_message.text or msg.reply_to_message.caption):
+        payload = msg.reply_to_message.text or msg.reply_to_message.caption or ""
+    if not payload.strip():
+        await msg.reply_text("Usage: <code>/shadowreply Your anonymous message</code>\nI’ll delete your command and repost as the bot.", parse_mode=ParseMode.HTML)
+        return
+    # Delete trigger instantly
+    try:
+        await msg.delete()
+    except Exception:
+        try:
+            await context.bot.delete_message(chat.id, msg.message_id)
+        except Exception:
+            pass
+    # Republish as bot identity (clean payload, no trace)
+    try:
+        await context.bot.send_message(chat.id, payload, parse_mode=ParseMode.HTML)
+    except BadRequest:
+        # fallback plain
+        await context.bot.send_message(chat.id, payload)
+
+# ──────────────────────────────────────────
+# Wordle / Jumble Multiplayer Game
+# ──────────────────────────────────────────
+def score_guess(secret: str, guess: str) -> List[str]:
+    """
+    Duplicate-aware Wordle scoring.
+    🎯 = correct letter & position (green)
+    🔀 = correct letter, wrong position (yellow)
+    🚫 = absent
+    """
+    n = len(secret)
+    res = ["🚫"] * n
+    # count remaining letters in secret after greens
+    secret_chars = list(secret.lower())
+    guess_chars = list(guess.lower())
+    # First pass: greens
+    remaining = {}
+    for i in range(n):
+        if guess_chars[i] == secret_chars[i]:
+            res[i] = "🎯"
+        else:
+            remaining[secret_chars[i]] = remaining.get(secret_chars[i], 0) + 1
+    # Second pass: yellows (respect counts)
+    for i in range(n):
+        if res[i] == "🎯":
+            continue
+        g = guess_chars[i]
+        if remaining.get(g, 0) > 0:
+            res[i] = "🔀"
+            remaining[g] -= 1
+    return res
+
+async def cmd_newgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    msg = update.effective_message
+    if not chat or not msg:
+        return
+    # Determine length from command: /new, /new4, /new5, /new6
+    raw_cmd = ""
+    if msg.text:
+        raw_cmd = msg.text.split()[0].split("@")[0].lstrip("/").lower()
+    length = 5
+    if raw_cmd in ("new4", "new_4", "word4"):
+        length = 4
+    elif raw_cmd in ("new5", "new_5", "word5"):
+        length = 5
+    elif raw_cmd in ("new6", "new_6", "word6"):
+        length = 6
+    elif raw_cmd in ("new", "newword", "newgame", "word", "wordle"):
+        length = 5
+        # allow arg to override
+        if context.args and context.args[0].isdigit() and int(context.args[0]) in (4,5,6):
+            length = int(context.args[0])
+    else:
+        # generic handler fallback
+        length = 5
+
+    # Pick random word
+    pool = WORD_BANK.get(length, WORD_BANK[5])
+    word = random.choice(pool)
+    await db.start_game(chat.id, word, update.effective_user.id if update.effective_user else 0)
+    await msg.reply_html(
+        f"🎲 <b>Word Jumble Started!</b> — {length} letters\n"
+        f"Guess with plain text ({length} letters). I’ll score: 🎯 correct spot, 🔀 wrong spot, 🚫 not in word.\n"
+        f"Commands: <code>/game</code> status, <code>/top</code> leaderboard\n"
+        f"<i>Word chosen — begin!</i>"
+    )
+    log.info("GAME start chat=%s length=%s word=%s by=%s", chat.id, length, word, update.effective_user.id if update.effective_user else "?")
+
+async def cmd_gamestatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    game = await db.get_game(chat.id)  # type: ignore
+    if not game:
+        await update.effective_message.reply_text("No active game. Start one with /new, /new4, /new5, /new6")
+        return
+    word, length, starter, attempts = game
+    await update.effective_message.reply_html(
+        f"🎮 <b>Game Active</b>\nLetters: {length}\nAttempts: {attempts}\nStarter: <code>{starter}</code>\n"
+        f"Send a {length}-letter word to guess!"
+    )
+
+async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = await db.top_players(limit=10)
+    if not rows:
+        await update.effective_message.reply_text("No wins yet. Play with /new!")
+        return
+    lines = ["🏆 <b>Career Wins — Top Players</b>"]
+    for idx, (uid, uname, wins) in enumerate(rows, 1):
+        display = esc(uname) if uname else f"ID {uid}"
+        lines.append(f"{idx}. {display} — {wins} win{'s' if wins!=1 else ''}")
+    await update.effective_message.reply_html("\n".join(lines))
+
+async def handle_wordle_guess(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Plain text handler — scores guesses if game active and length matches."""
+    msg = update.effective_message
+    if not msg or not msg.text or not update.effective_chat:
+        return
+    if update.effective_chat.type == "private":
+        return
+    text = msg.text.strip()
+    # Ignore commands, mentions, hashtags handled elsewhere, very long/short
+    if text.startswith("/") or text.startswith("#") or text.startswith("@"):
+        return
+    # Only consider single-word alphabetic guesses
+    if " " in text or not text.isalpha():
+        return
+    chat_id = update.effective_chat.id
+    game = await db.get_game(chat_id)
+    if not game:
+        return
+    word, length, starter, attempts = game
+    if len(text) != length:
+        return
+    # Treat as guess
+    guess = text.lower()
+    secret = word.lower()
+    scoring = score_guess(secret, guess)
+    await db.bump_attempts(chat_id)
+    # Build reply
+    scored_line = " ".join(scoring)
+    user = update.effective_user
+    mention = mention_html(user.id, user.full_name) if user else esc(guess)
+    if guess == secret:
+        # win!
+        await db.add_win(user.id, user.username if user else None)
+        await db.stop_game(chat_id)
+        await msg.reply_html(
+            f"{scored_line}\n🎉 <b>Correct!</b> {mention} guessed <code>{esc(secret.upper())}</code>!\n"
+            f"Start a new round with /new, /new4, /new5, /new6"
+        )
+        log.info("GAME win chat=%s winner=%s word=%s attempts=%s", chat_id, user.id if user else "?", secret, attempts+1)
+    else:
+        await db.add_played(user.id, user.username if user else None)
+        await msg.reply_html(
+            f"{mention} → <code>{esc(guess.upper())}</code>\n{scored_line}\n"
+            f"<i>Hint: 🎯 right spot, 🔀 wrong spot, 🚫 not in word</i>"
+        )
+
+# ──────────────────────────────────────────
+# Utility Commands: /start /help /locks /id
+# ──────────────────────────────────────────
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = (
+        "✨ <b>Miss Sona — Group Guardian</b> ✨\n\n"
+        "I merge industrial moderation with Miss Rose elegance.\n\n"
+        "<b>Moderation:</b> /ban /unban /mute /unmute /warn /warns\n"
+        "<b>Content:</b> /rules /setrules /note /setnote /delnote  (use #notename)\n"
+        "<b>Trust:</b> /trust /untrust  (bypass filters)\n"
+        "<b>Security:</b> /locks — anti-link • anti-spam • OCR Shield • CAPTCHA Gate\n"
+        "<b>Global Vault (owner):</b> /addbword /rmbword /listbwords\n"
+        "<b>Mentions:</b> /all [text] • /admins [text]  (5 per 3s, flood-safe)\n"
+        "<b>Shadow:</b> /shadowreply [message]\n"
+        "<b>Games:</b> /new /new4 /new5 /new6 • /game • /top\n\n"
+        "Add me as admin with delete + ban permissions for full power."
+    )
+    await update.effective_message.reply_html(txt)
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_start(update, context)
+
+async def cmd_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    lines = [f"👤 You: <code>{user.id}</code> — {esc(user.full_name)}" if user else ""]
+    if chat:
+        lines.append(f"💬 Chat: <code>{chat.id}</code> — {esc(chat.title or chat.type)}")
+    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+        u = msg.reply_to_message.from_user
+        lines.append(f"↩️ Replied user: <code>{u.id}</code> — {esc(u.full_name)}")
+    await msg.reply_html("\n".join(lines))
+
+async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await cmd_id(update, context)
+
+# ──────────────────────────────────────────
+# Global Error Handler
+# ──────────────────────────────────────────
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.exception("Update %s caused error: %s", update, context.error)
+    # Don't spam user unless it's a command interaction
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            # Only notify for non-flood errors during commands
+            if "Flood" not in str(context.error):
+                pass
+        except Exception:
             pass
 
+# ──────────────────────────────────────────
+# Application Factory
+# ──────────────────────────────────────────
+def build_app() -> Application:
+    if BOT_TOKEN == "PUT_YOUR_TOKEN_HERE":
+        log.warning("BOT_TOKEN not set — set env var BOT_TOKEN before starting.")
+    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-async def post_init(application: Application) -> None:
-    cfg: Config = application.bot_data["cfg"]
-    db: Database = application.bot_data["db"]
-    if cfg.tesseract_cmd and OCR_AVAILABLE and pytesseract is not None:
-        pytesseract.pytesseract.tesseract_cmd = cfg.tesseract_cmd
-    await db.run(db.init_schema)
-    # Restart safety: re-arm timeouts for users still awaiting verification.
-    pending = await db.run(db.pending_captchas)
-    now = time.time()
-    for row in pending:
-        remaining = max(1.0, float(cfg.captcha_timeout) - (now - float(row["created_at"])))
-        schedule_captcha_timeout(application, int(row["chat_id"]), int(row["user_id"]),
-                                 str(row["token"]), remaining)
-    me = await application.bot.get_me()
-    logger.info("Miss Sona @%s ready | OCR=%s | DB=%s | pending captchas=%d | owners=%d",
-                me.username, "on" if OCR_AVAILABLE else "off", cfg.db_path,
-                len(pending), len(cfg.owner_ids))
+    # ─ Handler Groups — explicit, robust structure ─
+    GROUP_TRACK = -1   # activity pooling (runs first)
+    GROUP_SECURITY = 0 # locks / OCR / anti-spam
+    GROUP_MAIN = 1     # moderation / captcha / games
+    GROUP_FALLBACK = 2 # notes hashtag, plain guesses
 
+    # Activity tracker — runs on every group message (lowest group)
+    app.add_handler(MessageHandler(filters.ALL, track_activity), group=GROUP_TRACK)
 
-async def post_shutdown(application: Application) -> None:
-    db: Database = application.bot_data["db"]
-    await db.run(db.close)
-    for task in list(BACKGROUND_TASKS):
-        task.cancel()
-    logger.info("Miss Sona shutdown complete")
+    # Security pipeline
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_security_message), group=GROUP_SECURITY)
+    app.add_handler(MessageHandler(filters.CaptionEntity(filters.ALL), handle_security_message), group=GROUP_SECURITY)
+    # OCR: photos + image documents (separate handler)
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo_document), group=GROUP_SECURITY)
 
+    # CAPTCHA: new members + verify callback
+    app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members), group=GROUP_MAIN)
+    app.add_handler(CallbackQueryHandler(cb_captcha_verify, pattern=r"^captcha_\d+$"), group=GROUP_MAIN)
 
-def register_handlers(application: Application, cfg: Config) -> None:
-    """Explicit handler groups: exactly one handler per group handles an update."""
-    groups = filters.ChatType.GROUPS
-    text_no_cmd = groups & filters.TEXT & ~filters.COMMAND
+    # Locks panel
+    app.add_handler(CommandHandler("locks", cmd_locks, filters=filters.ChatType.GROUPS), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("lock", cmd_locks, filters=filters.ChatType.GROUPS), group=GROUP_MAIN)
+    app.add_handler(CallbackQueryHandler(cb_toggle_locks, pattern=r"^(toggle_|close_locks)"), group=GROUP_MAIN)
 
-    # -10 runs first for every group message; it only stops unverified users.
-    application.add_handler(MessageHandler(groups & filters.ALL, on_any_group_message), group=-10)
+    # Moderation
+    app.add_handler(CommandHandler(["ban","dban","sban"], cmd_ban), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("unban", cmd_unban), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["mute","restrict"], cmd_mute), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["unmute","unrestrict"], cmd_unmute), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("warn", cmd_warn), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["warns","warnings"], cmd_warns), group=GROUP_MAIN)
 
-    public_commands = {
-        "start": cmd_start, "help": cmd_help, "ping": cmd_ping, "id": cmd_id,
-        # Work in the group AND in private chat (for the group linked by /connect).
-        "connect": cmd_connect, "connection": cmd_connection, "disconnect": cmd_disconnect,
-        "welcome": cmd_show_greeting, "setwelcome": cmd_set_greeting, "rmwelcome": cmd_rm_greeting,
-        "goodbye": cmd_show_greeting, "setgoodbye": cmd_set_greeting, "rmgoodbye": cmd_rm_greeting,
-        "banned": cmd_banned, "unban": cmd_unban,
-    }
-    group_commands = {
-        "ban": cmd_ban, "kick": cmd_kick, "mute": cmd_mute, "unmute": cmd_unmute,
-        "mentionall": on_broadcast, "tagall": on_broadcast, "all": on_broadcast,
-        "cancel": cmd_cancel,
-        "warn": cmd_warn, "warns": cmd_warns,
-        "setrules": cmd_setrules, "rules": cmd_rules,
-        "setnote": cmd_setnote, "note": cmd_note, "notes": cmd_notes, "delnote": cmd_delnote,
-        "trust": cmd_trust, "untrust": cmd_untrust,
-        "shadowreply": cmd_shadowreply,
-        "new": cmd_new, "new4": cmd_new, "new5": cmd_new, "new6": cmd_new,
-        "game": cmd_game, "stopgame": cmd_stopgame, "top": cmd_top,
-    }
-    for name, handler in public_commands.items():
-        application.add_handler(CommandHandler(name, handler), group=0)
-    for name, handler in group_commands.items():
-        application.add_handler(CommandHandler(name, handler, filters=groups), group=0)
+    # Rules / Notes
+    app.add_handler(CommandHandler("rules", cmd_rules), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("setrules", cmd_setrules), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["setnote","savenote","addnote","note"], cmd_setnote), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["getnote","notes"], cmd_getnote), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("delnote", cmd_delnote), group=GROUP_MAIN)
+    # Also allow /#notename? handled by hashtag handler
 
-    # A photo captioned "/setwelcome ..." is not a text command, so match the caption.
-    application.add_handler(MessageHandler(
-        filters.PHOTO & filters.CaptionRegex(r"(?i)^/set(welcome|goodbye)\b"),
-        cmd_set_greeting), group=0)
-    application.add_handler(CallbackQueryHandler(on_captcha_button, pattern=r"^cv:"), group=0)
-    application.add_handler(
-        ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER), group=0
-    )
+    # Trust
+    app.add_handler(CommandHandler("trust", cmd_trust), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("untrust", cmd_untrust), group=GROUP_MAIN)
 
-    # Group 2: mass mentions. Group 3: game guesses. Both stop further processing.
-    application.add_handler(MessageHandler(
-        text_no_cmd & filters.Regex(r"(?i)^@(all|admin)\b"), on_broadcast), group=2)
-    application.add_handler(MessageHandler(text_no_cmd, on_guess), group=3)
+    # Global banned-word vault (owner)
+    app.add_handler(CommandHandler(["addbword","addbanword","gbanword","addglobalban"], cmd_addbanword), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["rmbword","removebanword","delbword","delbanword","rmglobalban"], cmd_rmbanword), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["listbwords","bannedwords","globalbans","listbans"], cmd_listbanwords), group=GROUP_MAIN)
 
-    # Group 4: final safeguard pass for text, captions and images.
-    application.add_handler(MessageHandler(
-        groups & ~filters.COMMAND &
-        (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.ANIMATION | filters.Document.IMAGE),
-        on_group_message), group=4)
-    logger.info("Registered %d command handlers in 6 handler groups",
-                len(public_commands) + len(group_commands))
+    # Throttled mass mentions
+    app.add_handler(CommandHandler(["all","tagall","everyone","mentionall"], cmd_all), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["admins","admin","tagadmins"], cmd_admins), group=GROUP_MAIN)
 
+    # Shadow reply
+    app.add_handler(CommandHandler("shadowreply", cmd_shadowreply), group=GROUP_MAIN)
 
-def main() -> None:
-    cfg = Config.from_env()
-    logging.basicConfig(
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    )
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("apscheduler").setLevel(logging.WARNING)
-    if not OCR_AVAILABLE:
-        logger.warning("Pillow/pytesseract unavailable — image OCR is disabled.")
+    # Wordle / Jumble
+    app.add_handler(CommandHandler(["new","new4","new5","new6","newword","newgame","word","wordle","word4","word5","word6"], cmd_newgame), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["game","gamestatus","status"], cmd_gamestatus), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["top","leaderboard","lb"], cmd_top), group=GROUP_MAIN)
 
-    db = Database(cfg.db_path)
-    application = (
-        ApplicationBuilder()
-        .token(cfg.token)
-        .post_init(post_init)
-        .post_shutdown(post_shutdown)
-        .build()
-    )
-    application.bot_data.update(
-        cfg=cfg,
-        db=db,
-        matcher=KeywordMatcher(cfg.banned_words),
-        words=load_word_bank(cfg.words_file),
-    )
-    register_handlers(application, cfg)
-    application.add_error_handler(error_handler)
+    # Utility
+    app.add_handler(CommandHandler("start", cmd_start), group=GROUP_MAIN)
+    app.add_handler(CommandHandler("help", cmd_help), group=GROUP_MAIN)
+    app.add_handler(CommandHandler(["id","chatid","myid"], cmd_id), group=GROUP_MAIN)
 
-    logger.info("Starting Miss Sona (python-telegram-bot, long polling)…")
-    # ALL_TYPES is required: chat_member updates drive the captcha gate.
-    application.run_polling(
+    # Fallback group — hashtag notes + wordle guesses (must be after commands)
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^#\w+"), hashtag_note_handler), group=GROUP_FALLBACK)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.StatusUpdate.ALL, handle_wordle_guess), group=GROUP_FALLBACK)
+
+    # Error handler
+    app.add_error_handler(error_handler)
+
+    return app
+
+# ──────────────────────────────────────────
+# Lifecycle
+# ──────────────────────────────────────────
+async def post_init(app: Application):
+    await db.init()
+    me = await app.bot.get_me()
+    log.info("Miss Sona online as @%s (id=%s) — WAL SQLite at %s", me.username, me.id, DB_PATH)
+    if OWNER_ID:
+        log.info("Owner ID: %s", OWNER_ID)
+    else:
+        log.info("OWNER_ID not set — global vault will be owner-restricted only if configured.")
+
+async def post_shutdown(app: Application):
+    log.info("Miss Sona shutting down…")
+
+def main():
+    app = build_app()
+    app.post_init = post_init  # type: ignore
+    app.post_shutdown = post_shutdown  # type: ignore
+    # Run with clean HTML, drop pending updates = True for fresh deploys
+    app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=False,
-        timeout=30,
+        drop_pending_updates=True,
+        close_loop=False,
     )
-
 
 if __name__ == "__main__":
     main()
