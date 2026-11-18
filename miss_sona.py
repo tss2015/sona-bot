@@ -336,17 +336,19 @@ class Emojify:
     def emojify_word(word:str, scored:List[str])->str:
         return f"{word.upper()}  {' '.join(scored)}"
     @staticmethod
-    def stack_emojify(secret_word:str, guesses:List[dict], length:int, max_display:int=10) -> str:
-        header=f"📚 <b>Miss Sona Wordle — {length} Letters</b> | Attempts: {len(guesses)}/6\n"
+    def stack_emojify(secret_word:str, guesses:List[dict], length:int, max_attempts:int=25, max_display:int=25) -> str:
+        header=f"📚 <b>Miss Sona Wordle — {length} Letters</b> | Attempts: {len(guesses)}/{max_attempts}\n"
         header+=f"<code>┌{'─'*28}┐</code>\n"
         if not guesses:
             body=f"<code>│ {'No guesses yet. Send a '+str(length)+'-letter word!':28} │</code>\n"
         else:
             body=""
+            # Stacking: show cumulative words — e.g., books then books+catch
+            # Display last max_display guesses in stacked style (reference: books / catch example)
             for g in guesses[-max_display:]:
                 w=g['word'].upper()
                 scored=' '.join(g['scored'])
-                uname=g.get('username','?')[:12]
+                uname=g.get('username','?')[:10]
                 line=f"{w:6} {scored} by {uname}"
                 body+=f"<code>│ {line[:28].ljust(28)} │</code>\n"
         footer="<code>└────────────────────────────┘</code>\n"
@@ -368,7 +370,7 @@ class Database:
         cur.execute("""CREATE TABLE IF NOT EXISTS notes(chat_id INTEGER NOT NULL, name TEXT NOT NULL, content TEXT, created_by INTEGER, PRIMARY KEY(chat_id,name))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS trusted(chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, added_by INTEGER, PRIMARY KEY(chat_id,user_id))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS global_banned_words(word TEXT PRIMARY KEY COLLATE NOCASE, added_by INTEGER, added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS chat_settings(chat_id INTEGER PRIMARY KEY, tos_protection INTEGER DEFAULT 1, antilink INTEGER DEFAULT 1, antispam INTEGER DEFAULT 1, ocr_protection INTEGER DEFAULT 1, captcha_enabled INTEGER DEFAULT 1, lockwarns INTEGER DEFAULT 0, cleanwelcome INTEGER DEFAULT 0, cleanservice INTEGER DEFAULT 0, welcome_on INTEGER DEFAULT 1, goodbye_on INTEGER DEFAULT 0, antiflood_on INTEGER DEFAULT 1, flood_limit INTEGER DEFAULT 5, flood_mode TEXT DEFAULT 'tmute 1h', warn_limit INTEGER DEFAULT 3, warn_mode TEXT DEFAULT 'ban', welcome_clean_msg_id INTEGER)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS chat_settings(chat_id INTEGER PRIMARY KEY, tos_protection INTEGER DEFAULT 1, antilink INTEGER DEFAULT 1, antispam INTEGER DEFAULT 1, ocr_protection INTEGER DEFAULT 1, captcha_enabled INTEGER DEFAULT 1, lockwarns INTEGER DEFAULT 0, cleanwelcome INTEGER DEFAULT 0, cleanservice INTEGER DEFAULT 0, welcome_on INTEGER DEFAULT 1, goodbye_on INTEGER DEFAULT 0, antiflood_on INTEGER DEFAULT 1, flood_limit INTEGER DEFAULT 5, flood_mode TEXT DEFAULT 'tmute 1h', warn_limit INTEGER DEFAULT 3, warn_mode TEXT DEFAULT 'ban', welcome_clean_msg_id INTEGER, game_max_attempts INTEGER DEFAULT 25)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS active_users(chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, fullname TEXT, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(chat_id,user_id))""")
         cur.execute("""CREATE TABLE IF NOT EXISTS games(chat_id INTEGER PRIMARY KEY, word TEXT, length INTEGER, starter_id INTEGER, attempts INTEGER DEFAULT 0, is_active INTEGER DEFAULT 1, guesses_json TEXT DEFAULT '[]', board_msg_id INTEGER, started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS leaderboard(user_id INTEGER PRIMARY KEY, username TEXT, wins INTEGER DEFAULT 0, games_played INTEGER DEFAULT 0)""")
@@ -394,6 +396,8 @@ class Database:
         try: cur.execute("ALTER TABLE chat_settings ADD COLUMN tos_protection INTEGER DEFAULT 1")
         except: pass
         try: cur.execute("ALTER TABLE connections ADD COLUMN chat_title TEXT")
+        except: pass
+        try: cur.execute("ALTER TABLE chat_settings ADD COLUMN game_max_attempts INTEGER DEFAULT 25")
         except: pass
         for col in ["welcome_media_type TEXT","welcome_file_id TEXT","goodbye_media_type TEXT","goodbye_file_id TEXT","welcome_buttons_json TEXT"]:
             try: cur.execute(f"ALTER TABLE greetings ADD COLUMN {col}")
@@ -507,6 +511,22 @@ class Database:
     async def get_user_chatfight(self, chat_id, user_id):
         row=await self._exec("SELECT msg_count FROM chatfight_scores WHERE chat_id=? AND user_id=?",(chat_id,user_id),fetch="one")
         return row[0] if row else 0
+    # ── Group Arena aliases (chatfight -> arena) ──
+    async def bump_arena(self, chat_id, user_id, username, fullname):
+        return await self.bump_chatfight(chat_id, user_id, username, fullname)
+    async def get_arena_top(self, chat_id, limit=15):
+        return await self.get_chatfight_top(chat_id, limit)
+    async def get_user_arena(self, chat_id, user_id):
+        return await self.get_user_chatfight(chat_id, user_id)
+    # ── Game attempts per group (default 25, admin configurable) ──
+    async def get_max_attempts(self, chat_id):
+        row=await self._exec("SELECT game_max_attempts FROM chat_settings WHERE chat_id=?",(chat_id,),fetch="one")
+        if row and row[0] is not None:
+            return int(row[0])
+        return 25
+    async def set_max_attempts(self, chat_id, n):
+        await self.get_settings(chat_id)
+        await self._exec("UPDATE chat_settings SET game_max_attempts=? WHERE chat_id=?",(int(n), chat_id))
     async def check_global(self, text):
         words=await self.list_global_words(); low=text.lower()
         for w in words:
@@ -1771,7 +1791,8 @@ async def cmd_newgame(update,context):
         w,l,s,a,gj,bid=existing
         try: sm=await context.bot.get_chat_member(cid,s); sname=sm.user.full_name
         except: sname=str(s)
-        await update.effective_message.reply_html(f"⚠️ <b>Another game is already in progress in this chat!</b>\nWord length: {l} | Starter: {esc(sname)} | Attempts: {a}\nFinish it or /endgame to start new")
+        max_a=await db.get_max_attempts(cid)
+        await update.effective_message.reply_html(f"⚠️ <b>Another game is already in progress in this chat!</b>\nWord length: {l} | Starter: {esc(sname)} | Attempts: {a}/{max_a}\nFinish it or /endgame to start new")
         return
     raw=update.effective_message.text.split()[0].split("@")[0].lstrip("/").lower() if update.effective_message.text else "new"
     length=5
@@ -1780,11 +1801,16 @@ async def cmd_newgame(update,context):
     elif raw in ("new6","word6"): length=6
     elif raw in ("new","newword","newgame","word","wordle"): length=5
     if context.args and context.args[0].isdigit() and int(context.args[0]) in (4,5,6): length=int(context.args[0])
+    else:
+        # Also support /new6 as arg like /new 6
+        for arg in (context.args or []):
+            if arg.isdigit() and int(arg) in (4,5,6): length=int(arg); break
+    max_a=await db.get_max_attempts(cid)
     pool=WORD_BANK.get(length,WORD_BANK[5]); word=random.choice(pool)
     await db.start_game(cid,word,update.effective_user.id)
-    board=Emojify.stack_emojify(word,[],length)
-    await update.effective_message.reply_html(f"🎲 <b>Word Jumble Started!</b> — {length} letters\nSend a {length}-letter word to guess. 🎯=perfect 🔀=misplaced 🚫=absent\n\n{board}")
-    await log_to_support(context,f"NEW GAME {length}L by {update.effective_user.id}",cid,update.effective_user.id,detail=word)
+    board=Emojify.stack_emojify(word,[],length, max_a)
+    await update.effective_message.reply_html(f"🎲 <b>Word Jumble Started!</b> — {length} letters | Attempts allowed: {max_a}\nSend a {length}-letter word to guess. 🎯=perfect 🔀=misplaced 🚫=absent\nUse <code>/setattempts {max_a}</code> (admin) to change limit.\n\n{board}")
+    await log_to_support(context,f"NEW GAME {length}L max{max_a} by {update.effective_user.id}",cid,update.effective_user.id,detail=word)
 
 async def cmd_endgame(update,context):
     cid=await effective_chat_id(update,context)
@@ -1804,8 +1830,9 @@ async def cmd_gamestatus(update,context):
     if not g: await update.effective_message.reply_text("No game. /new /new4 /new5 /new6"); return
     w,l,s,a,gj,bid=g
     guesses=json.loads(gj or "[]")
-    board=Emojify.stack_emojify(w,guesses,l)
-    await update.effective_message.reply_html((board + f"\n\n<b>Starter:</b> <code>{s}</code> | <b>Attempts:</b> {a}"))
+    max_a=await db.get_max_attempts(cid)
+    board=Emojify.stack_emojify(w,guesses,l,max_a)
+    await update.effective_message.reply_html((board + f"\n\n<b>Starter:</b> <code>{s}</code> | <b>Attempts:</b> {a}/{max_a}"))
 
 async def cmd_top(update,context):
     # Global top (all groups) — uses leaderboard
@@ -1852,7 +1879,7 @@ async def cmd_mystats(update,context):
             except: ct_title=str(chat_id)
             lines.append(f"{idx}. {ct_title} — <code>{chat_id}</code> → {gwins} wins / {gplayed} played")
         # Also show message activity rank for context
-        lines.append(f"\n<i>Use /chatfight to see activity ranking in this group.</i>")
+        lines.append(f"\n<i>Use /arena to see Group Arena ranking in this group.</i>")
     else:
         lines.append("\n<i>No per-group games yet — play in a group with /new</i>")
     # Recent history
@@ -1864,26 +1891,58 @@ async def cmd_mystats(update,context):
     await update.effective_message.reply_html("\n".join(lines))
 
 async def cmd_chatfight(update,context):
+    # Renamed to Group Arena — keep old name as alias
     cid=await effective_chat_id(update,context)
     if not cid: return
     rows=await db.get_chatfight_top(cid, 15)
     if not rows: await update.effective_message.reply_text("No activity yet — chat to rank!"); return
     try: chat_title=esc((await context.bot.get_chat(cid)).title or str(cid))
     except: chat_title=str(cid)
-    lines=[f"⚔️ <b>Chatfight — Most Active in {chat_title}</b>\n<i>Ranked by messages</i>"]
+    lines=[f"⚔️ <b>Group Arena — Most Active in {chat_title}</b>\n<i>Ranked by messages (Group Arena)</i>"]
     for i,(uid, uname, fname, cnt) in enumerate(rows,1):
-        # Medal
         medal="🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else f"{i}."
         lines.append(f"{medal} {esc(fname or uname or str(uid))} — {cnt} msgs {mention_html(uid, fname or uname or str(uid))}")
-    # Show requester's rank
     if update.effective_user:
         mycnt=await db.get_user_chatfight(cid, update.effective_user.id)
         if mycnt:
-            # Find rank
             all_rows=await db.get_chatfight_top(cid, 100)
             rank=next((idx for idx,(uid,_,_,_) in enumerate(all_rows,1) if uid==update.effective_user.id), None)
             if rank: lines.append(f"\n👤 You: rank #{rank} with {mycnt} msgs")
     await update.effective_message.reply_html("\n".join(lines))
+
+async def cmd_arena(update,context):
+    return await cmd_chatfight(update, context)
+
+# ── Game attempts admin setting (default 25) ──
+async def cmd_setattempts(update,context):
+    cid=await effective_chat_id(update,context)
+    if not cid: return
+    # Only group admin can set
+    if not await is_admin(update, context):
+        await update.effective_message.reply_text("🚫 Only group admins can set attempts."); return
+    if not context.args:
+        cur=await db.get_max_attempts(cid)
+        await update.effective_message.reply_html(f"🎯 <b>Game Attempts:</b> {cur} (default 25)\nUsage: <code>/setattempts 25</code> — admin can change. Min 5, max 100.")
+        return
+    try:
+        n=int(context.args[0])
+        if n<5 or n>100: raise ValueError
+    except:
+        await update.effective_message.reply_text("Usage: /setattempts <5-100> — e.g., /setattempts 25"); return
+    await db.set_max_attempts(cid, n)
+    await update.effective_message.reply_html(f"✅ Game max attempts set to <b>{n}</b> for this group. New games will allow {n} tries.")
+    await log_to_support(context, f"SET ATTEMPTS {n}", cid, update.effective_user.id)
+
+async def cmd_attempts(update,context):
+    cid=await effective_chat_id(update,context)
+    if not cid: return
+    cur=await db.get_max_attempts(cid)
+    g=await db.get_game(cid)
+    if g:
+        secret,length,starter,attempts,gj,bid=g
+        await update.effective_message.reply_html(f"🎯 Attempts: {attempts}/{cur} (limit {cur}) | Word length: {length}")
+    else:
+        await update.effective_message.reply_html(f"🎯 Group game attempts limit: <b>{cur}</b> (default 25)\nAdmin can change via <code>/setattempts &lt;n&gt;</code>")
 
 async def handle_wordle(update,context):
     msg=update.effective_message
@@ -1895,42 +1954,46 @@ async def handle_wordle(update,context):
     g=await db.get_game(cid)
     if not g: return
     secret,length,starter,attempts,gj,bid=g
+    # Length must match game length (e.g., new6 -> only 6-letter words)
     if len(txt)!=length: return
-    guesses=json.loads(gj or "[]")
-    # ── VALIDATED WORD CHECK (v5.0 FIX: reject bkilsd gibberish) ──
+    # Validate against dictionary for that length
     if not is_valid_word(txt, length):
         await msg.reply_html(f"❌ <code>{esc(txt.upper())}</code> is not a valid English word. Try a real word.")
         return
+    guesses=json.loads(gj or "[]")
     lower_words=[gg['word'].lower() for gg in guesses]
     if txt.lower() in lower_words:
         orig=next(gg for gg in guesses if gg['word'].lower()==txt.lower())
-        await msg.reply_html(f"😅 Sorry, the word <code>{esc(txt.upper())}</code> was already tried first by {mention_html(orig['user_id'], orig['username'])}! Try a new word.")
+        await msg.reply_html(f"😅 Sorry, the word <code>{esc(txt.upper())}</code> was already guessed by {mention_html(orig['user_id'], orig['username'])}! Try a new word.")
         return
     scored=Emojify.score_word(secret,txt.lower())
     new_entry={"word":txt.lower(), "user_id":update.effective_user.id, "username":update.effective_user.full_name, "scored":scored}
     guesses.append(new_entry)
     await db.set_guesses(cid, json.dumps(guesses))
     await db.bump_attempts(cid)
-    board=Emojify.stack_emojify(secret, guesses, length)
+    max_a=await db.get_max_attempts(cid)
+    board=Emojify.stack_emojify(secret, guesses, length, max_a, max_display=max_a)
     if txt.lower()==secret.lower():
         await db.record_game(cid, update.effective_user.id, (update.effective_user.username if isinstance(update.effective_user.username, str) else update.effective_user.full_name), secret, length, True, len(guesses))
         await db.stop_game(cid)
-        await msg.reply_html(board + f"\n\n🎉 <b>Correct!</b> {mention_html(update.effective_user.id,update.effective_user.full_name)} guessed <code>{esc(secret.upper())}</code> in {len(guesses)} tries!")
+        await msg.reply_html(board + f"\n\n🎉 <b>Correct!</b> {mention_html(update.effective_user.id,update.effective_user.full_name)} guessed <code>{esc(secret.upper())}</code> in {len(guesses)}/{max_a} tries!")
         await log_to_support(context,f"WORDLE WIN {secret} by {update.effective_user.id}",cid,update.effective_user.id)
     else:
-        # intermediate guess — not counted until game ends
-        try:
-            if bid:
-                await context.bot.edit_message_text(chat_id=cid, message_id=bid, text=(board), parse_mode=ParseMode.HTML)
-                return
-        except: pass
+        # Stacking logic: every guess shows cumulative list
+        # Example: first "books" -> shows books, second "catch" -> shows books + catch (stacked)
+        # We send new board message stacked (do not only edit old, send fresh stacked view)
+        # Also try to keep board_msg updated for status
         sent=await msg.reply_html(board)
         try: await db.set_board_msg(cid, sent.message_id)
         except: pass
-        if len(guesses)>=6:
+        # Try to edit previous board for cleanliness, but do not return — ensure current reply is always sent
+        if bid and bid != sent.message_id:
+            try: await context.bot.edit_message_text(chat_id=cid, message_id=bid, text=board, parse_mode=ParseMode.HTML)
+            except: pass
+        if len(guesses)>=max_a:
             await db.stop_game(cid)
-            await context.bot.send_message(cid, f"💀 Game over! The word was <code>{esc(secret.upper())}</code>", parse_mode=ParseMode.HTML)
-            await log_to_support(context,f"WORDLE LOSS word={secret}",cid,update.effective_user.id)
+            await context.bot.send_message(cid, f"💀 Game over! The word was <code>{esc(secret.upper())}</code> — {max_a} attempts reached.", parse_mode=ParseMode.HTML)
+            await log_to_support(context,f"WORDLE LOSS word={secret} max{max_a}",cid,update.effective_user.id)
 
 # ── Connect Multi-Group FIXED ──
 async def cmd_connect(update,context):
@@ -2072,7 +2135,7 @@ HELP_MEMBER_TEXT = (
     "• <code>/top</code> — global top (all groups)\n"
     "• <code>/gtop</code> — group top (this group ranking)\n"
     "• <code>/mystats</code> — your game stats + top groups (e.g., dhanush in 3 groups shows best groups)\n"
-    "• <code>/chatfight</code> — most active users by messages in this group\n"
+    "• <code>/arena</code> — group arena (most active by messages)\n"
     "• <code>/support</code> — support link\n"
     "\n<i>All other commands require admin/owner powers.</i>"
 )
@@ -2102,7 +2165,7 @@ HELP_OWNER_TEXT = (
     "• <code>/unfban</code> / <code>/listfbans</code>\n"
     "• <code>/logs</code> / <code>/modlogs</code> / <code>/banlogs</code> — view logs with reasons (per-group isolated, Bot Owner sees all)\n"
     "• <b>Game Owner:</b> <code>/gtop</code> group top, <code>/mystats</code> shows user's top groups (e.g., dhanush in 3 groups)\n"
-    "• <code>/chatfight</code> — activity ranking per group\n"
+    "• <code>/arena</code> — group arena activity ranking\n"
     "• <code>/setlog &lt;chat_id&gt;</code> / <code>/export</code> / <code>/import</code> / <code>/disable</code>\n"
     "\n<i>Bot Owner sees all; Group Owner sees only their group's data.</i>"
 )
@@ -2152,18 +2215,19 @@ async def cb_game(update,context):
         kb=InlineKeyboardMarkup([
             [InlineKeyboardButton("🆕 New 4", callback_data="game_new4"), InlineKeyboardButton("🆕 New 5", callback_data="game_new5"), InlineKeyboardButton("🆕 New 6", callback_data="game_new6")],
             [InlineKeyboardButton("🏆 Group Top", callback_data="game_gtop"), InlineKeyboardButton("👤 My Stats", callback_data="game_mystats")],
-            [InlineKeyboardButton("⚔️ Chatfight", callback_data="game_chatfight"), InlineKeyboardButton("🌐 Global Top", callback_data="game_top")],
+            [InlineKeyboardButton("⚔️ Group Arena", callback_data="game_arena"), InlineKeyboardButton("🌐 Global Top", callback_data="game_top")],
             [InlineKeyboardButton("⬅️ Back", callback_data="help_main")]
         ])
         txt=(
             "🎮 <b>Game Center</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "Any user can start a new word game here.\n"
-            "• <b>New 4/5/6</b> — start 4/5/6-letter game in this chat\n"
+            "Any user can start a new word game here — scans only valid words of chosen length.\n"
+            "• <b>New 4/5/6</b> — start 4/5/6-letter game in this chat (e.g., new6 scans 6-letter words)\n"
             "• <b>Group Top</b> — this group's leaderboard\n"
             "• <b>My Stats</b> — your global + top groups (e.g., dhanush in 3 groups)\n"
-            "• <b>Chatfight</b> — most active by messages\n"
-            "• <b>Global Top</b> — all groups ranking"
+            "• <b>Group Arena</b> — most active by messages (formerly Chatfight)\n"
+            "• <b>Global Top</b> — all groups ranking\n"
+            "• Attempts default 25 — admin can set via /setattempts"
         )
         try: await q.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
         except: await q.message.reply_html(txt, reply_markup=kb)
@@ -2181,12 +2245,12 @@ async def cb_game(update,context):
             except: sname=str(s)
             await q.answer(f"Game already in progress {l}L by {sname}", show_alert=True)
             return
+        max_a=await db.get_max_attempts(cid)
         pool=WORD_BANK.get(length, WORD_BANK[5]); word=random.choice(pool)
         await db.start_game(cid, word, q.from_user.id if q.from_user else 0)
-        board=Emojify.stack_emojify(word, [], length)
-        # Send to group chat, not callback message
+        board=Emojify.stack_emojify(word, [], length, max_a)
         try:
-            await context.bot.send_message(cid, f"🎲 <b>Word Jumble Started!</b> — {length} letters\nStarter: {esc(q.from_user.full_name if q.from_user else 'Player')}\nSend a {length}-letter word to guess. 🎯=perfect 🔀=misplaced 🚫=absent\n\n{board}", parse_mode=ParseMode.HTML)
+            await context.bot.send_message(cid, f"🎲 <b>Word Jumble Started!</b> — {length} letters | Attempts: {max_a}\nStarter: {esc(q.from_user.full_name if q.from_user else 'Player')}\nSend a {length}-letter word to guess (only {length}-letter valid words scanned). 🎯=perfect 🔀=misplaced 🚫=absent\n\n{board}", parse_mode=ParseMode.HTML)
             await q.answer("Game started!", show_alert=False)
             await log_to_support(context, f"NEW GAME {length}L via Button by {q.from_user.id if q.from_user else 0}", cid, q.from_user.id if q.from_user else 0, detail=word)
         except Exception as e:
@@ -2231,7 +2295,7 @@ async def cb_game(update,context):
                 try: ct=await context.bot.get_chat(chat_id); ct_title=esc(ct.title or str(chat_id))
                 except: ct_title=str(chat_id)
                 lines.append(f"{idx}. {ct_title} — <code>{chat_id}</code> → {gwins} wins / {gplayed} played")
-            lines.append(f"\n<i>Use Chatfight to see activity ranking.</i>")
+            lines.append(f"\n<i>Use Group Arena (/arena) to see activity ranking — default 25 attempts, admin can change.</i>")
         hist=await db._exec("SELECT chat_id, word, won, attempts, timestamp FROM game_history WHERE user_id=? ORDER BY timestamp DESC LIMIT 5",(uid,),fetch="all")
         if hist:
             lines.append("\n📜 <b>Recent:</b>")
@@ -2241,14 +2305,14 @@ async def cb_game(update,context):
         try: await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
         except: await q.message.reply_html("\n".join(lines), reply_markup=kb)
 
-    elif data=="game_chatfight":
+    elif data in ("game_arena","game_chatfight"):
         cid=await get_cid()
         if not cid: await q.answer("No chat", show_alert=True); return
         rows=await db.get_chatfight_top(cid, 15)
         if not rows: await q.answer("No activity yet — chat to rank!", show_alert=True); return
         try: chat_title=esc((await context.bot.get_chat(cid)).title or str(cid))
         except: chat_title=str(cid)
-        lines=[f"⚔️ <b>Chatfight — Most Active in {chat_title}</b>\n<i>Ranked by messages</i>"]
+        lines=[f"⚔️ <b>Group Arena — Most Active in {chat_title}</b>\n<i>Ranked by messages (Group Arena)</i>"]
         for i,(uid, uname, fname, cnt) in enumerate(rows,1):
             medal="🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else f"{i}."
             lines.append(f"{medal} {esc(fname or uname or str(uid))} — {cnt} msgs {mention_html(uid, fname or uname or str(uid))}")
@@ -2373,6 +2437,9 @@ def build_app():
     app.add_handler(CommandHandler(["gtop","grouptop","group_top","rank"], cmd_group_top), group=G_MAIN)
     app.add_handler(CommandHandler(["mystats","myrank","mystat","mygroup","mygroups","profile"], cmd_mystats), group=G_MAIN)
     app.add_handler(CommandHandler(["chatfight","activity","topchat","chatrank","leaderchat"], cmd_chatfight), group=G_MAIN)
+    app.add_handler(CommandHandler(["arena","grouparena","group_arena","ga","arenatop"], cmd_arena), group=G_MAIN)
+    app.add_handler(CommandHandler(["setattempts","setgameattempts","gameattempts","set_attempts"], cmd_setattempts), group=G_MAIN)
+    app.add_handler(CommandHandler(["attempts","gameattempt","maxattempts"], cmd_attempts), group=G_MAIN)
     app.add_handler(CommandHandler("connect", cmd_connect), group=G_MAIN)
     app.add_handler(CommandHandler(["connections"], cmd_connections), group=G_MAIN)
     app.add_handler(CommandHandler(["disconnect","discon"], cmd_disconnect), group=G_MAIN)
