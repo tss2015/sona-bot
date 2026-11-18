@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 Miss Sona v6.0 TOS-AI — Industrial Telegram Group Management Bot
 ===========================================================
@@ -385,6 +386,8 @@ class Database:
             try: cur.execute(f"ALTER TABLE games ADD COLUMN {col} {typ}")
             except: pass
         try: cur.execute("ALTER TABLE chat_settings ADD COLUMN tos_protection INTEGER DEFAULT 1")
+        except: pass
+        try: cur.execute("ALTER TABLE connections ADD COLUMN chat_title TEXT")
         except: pass
         for col in ["welcome_media_type TEXT","welcome_file_id TEXT","goodbye_media_type TEXT","goodbye_file_id TEXT","welcome_buttons_json TEXT"]:
             try: cur.execute(f"ALTER TABLE greetings ADD COLUMN {col}")
@@ -1645,7 +1648,7 @@ async def cmd_import(update,context):
 
 # ── Utility ──
 async def cmd_start(update,context):
-    await update.effective_message.reply_html(branded_start("✨ <b>Miss Sona — The Secret Squad Guardian</b> ✨\n\nRose-parity + industrial modules.\n<b>Mod:</b> /ban /tban /mute /warn /promote /adminlist (all via reply/@ID)\n<b>Approve:</b> /approve /unapprove (via reply/@ID)\n<b>Locks:</b> /lock /unlock /locks /allowlist /setflood\n<b>Welcome:</b> /setwelcome {fullname} (reply to photo for media) /welcome on + CAPTCHA ✅\n<b>Filters:</b> /filter <trigger> <reply> or reply to media with /filter <trigger> — per-group!\n<b>Vault:</b> /addbword /listbwords (owner)\n<b>Broadcast:</b> /all /admins 5/3s\n<b>Shadow:</b> /shadowreply\n<b>Game:</b> /new /new4 /new5 /new6 /game /top — 📚 Stack Emojify Board\n<b>Support:</b> /support /setlog (logs all actions)\n<b>TOS AI:</b> /tos on/off — auto-delete Telegram TOS violating content (open-source AI) ✅\n<b>Connect:</b> /connect /connections (DM multi-group) — /connect in group then DM\n<b>Utility:</b> /export /import, /disable"))
+    await update.effective_message.reply_html(branded_start("✨ <b>Miss Sona — The Secret Squad Guardian</b> ✨\n\nRose-parity + industrial modules.\n<b>Mod:</b> /ban /tban /mute /warn /promote /adminlist (all via reply/@ID)\n<b>Approve:</b> /approve /unapprove (via reply/@ID)\n<b>Locks:</b> /lock /unlock /locks /allowlist /setflood\n<b>Welcome:</b> /setwelcome {fullname} (reply to photo for media) /welcome on + CAPTCHA ✅\n<b>Filters:</b> /filter &lt;trigger&gt; &lt;reply&gt; or reply to media with /filter &lt;trigger&gt; — per-group!\n<b>Vault:</b> /addbword /listbwords (owner)\n<b>Broadcast:</b> /all /admins 5/3s\n<b>Shadow:</b> /shadowreply\n<b>Game:</b> /new /new4 /new5 /new6 /game /top — 📚 Stack Emojify Board\n<b>Support:</b> /support /setlog (logs all actions)\n<b>TOS AI:</b> /tos on/off — auto-delete Telegram TOS violating content (open-source AI) ✅\n<b>Connect:</b> /connect /connections (DM multi-group) — /connect in group then DM\n<b>Utility:</b> /export /import, /disable"))
 async def cmd_help(update,context): await cmd_start(update,context) # uses branded_start via cmd_start
 async def cmd_id(update,context):
     msg=update.effective_message; user=update.effective_user
