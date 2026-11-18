@@ -6,8 +6,15 @@ python-telegram-bot[job-queue]>=20.8,<23.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
 
+# TOS AI Protection — open-source (optional, keyword fallback works without)
+# Uncomment to enable AI models:
+# transformers>=4.30.0
+# torch>=2.0.0  # or torch --index-url https://download.pytorch.org/whl/cpu
+# detoxify>=0.5.1
+# For NSFW image detection (optional):
+# transformers>=4.30.0
+
+# Lightweight TOS AI (always works, no install needed):
+# Keyword + regex heuristics built-in; enable full AI by installing above.
+
 # Standard library covers: asyncio, sqlite3, logging, re, html, etc.
-# No other external dependencies required.
-# ────────────────────────────────────────────
-# Install: pip install -r requirements.txt
-# OCR binary (system): sudo apt install tesseract-ocr
