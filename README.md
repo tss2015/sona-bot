@@ -1,231 +1,184 @@
-# 👑 Miss Sona --- The Secret Squad Guardian
+# 👑 Miss Sona — The Secret Squad Guardian
 
 ### 🛡️ Industrial Telegram Group Management & AI-Powered Protection Bot
 
-```{=html}
-<p align="center">
-```
-`<img src="assets/miss-sona-banner.png" alt="Miss Sona — The Secret Squad Guardian" width="100%">`{=html}
-```{=html}
-</p>
-```
-```{=html}
-<p align="center">
-```
-`<b>`{=html}Secure • Smart • Powerful • Always There`</b>`{=html}
-```{=html}
-</p>
-```
-```{=html}
-<p align="center">
-```
-Built with ❤️ by `<b>`{=html}The Secret Squad`</b>`{=html}
-```{=html}
-</p>
-```
-```{=html}
-<p align="center">
-```
-`<img src="https://img.shields.io/badge/Version-6.0-purple?style=for-the-badge">`{=html}
-`<img src="https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge">`{=html}
-`<img src="https://img.shields.io/badge/Telegram-Bot-blue?style=for-the-badge&logo=telegram">`{=html}
-`<img src="https://img.shields.io/badge/AI-Powered-ff69b4?style=for-the-badge">`{=html}
-`<img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge">`{=html}
-```{=html}
-</p>
-```
+![Miss Sona — The Secret Squad Guardian](assets/miss-sona-banner.png)
 
-------------------------------------------------------------------------
+**Secure • Smart • Powerful • Always There**
+
+Built with ❤️ by **The Secret Squad**
+
+[![Version](https://img.shields.io/badge/Version-6.0-purple?style=for-the-badge)](#project-information)
+[![Python](https://img.shields.io/badge/Python-3.8%2B-blue?style=for-the-badge&logo=python)](#technology-stack)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-blue?style=for-the-badge&logo=telegram)](https://core.telegram.org/bots)
+[![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)](LICENSE)
+
+---
 
 ## 🌟 Introducing Miss Sona
 
-**Miss Sona** is an advanced, single-file Telegram group management and
-protection bot designed to make community administration smarter, safer,
-and easier.
+**Miss Sona** is a single-file Telegram group-management and protection bot designed to make community administration smarter, safer, and easier.
 
-Powered by Python, asynchronous processing, SQLite WAL, and optional
-open-source AI moderation, Miss Sona brings professional-grade community
-management capabilities into one compact application.
-
-From automated moderation and anti-spam protection to OCR-based image
-scanning, customizable welcome messages, interactive games, and
-multi-group administration, Miss Sona provides an integrated solution
-for modern Telegram communities.
+Built with Python, asynchronous processing, SQLite WAL, and optional open-source AI moderation, Miss Sona brings moderation, anti-spam controls, OCR-assisted screening, welcome messages, filters, notes, games, and multi-group administration together in one application.
 
 **One file. Multiple capabilities. Complete community management.**
 
-### 💜 Why Miss Sona?
+### Why Miss Sona?
 
--   📦 **Single-file architecture:** Approximately 1,770 lines in
-    `miss_sona.py`.
--   🔐 **Strict group isolation:** Database operations are scoped by
-    `chat_id`.
--   🤖 **AI-assisted protection:** Optional open-source content
-    moderation.
--   🛡️ **Advanced moderation:** Automated restrictions, warnings, and
-    security locks.
--   🔗 **Multi-group management:** Control connected communities through
-    private messages.
--   ⚡ **Asynchronous architecture:** Built with `asyncio` and
-    `python-telegram-bot`.
--   💾 **Reliable storage:** SQLite with Write-Ahead Logging.
--   🎨 **Clean branding:** No unnecessary promotional messages in normal
-    group interactions.
+- 📦 **Single-file application:** The main implementation is `miss_sona.py` (approximately 1,770 lines, according to the project description).
+- 🔐 **Group-scoped data:** Group-specific database operations use `chat_id`.
+- 🤖 **Optional AI moderation:** Integrates with open-source moderation models.
+- 🛡️ **Flexible moderation:** Bans, mutes, kicks, warnings, approvals, and promotions.
+- 🔗 **Multi-group management:** Connect and manage groups from private chat.
+- ⚡ **Asynchronous processing:** Uses `asyncio` and `python-telegram-bot` v20+.
+- 💾 **Persistent storage:** SQLite configured for Write-Ahead Logging (WAL).
+- 🎨 **Clean presentation:** Branding is reserved for `/start` and `/help`, according to the project specification.
 
-------------------------------------------------------------------------
+---
 
-# 🚀 Core Features
+# 🚀 Features
 
-## 1. 🛡️ Advanced Moderation System
+## 1. 🛡️ Moderation
 
-Take complete control of your Telegram community with a comprehensive
-moderation toolkit.
+Manage members and enforce group rules with moderation commands.
 
-**Member management**
+### Member management
 
--   `/ban` --- Permanently ban a member.
--   `/tban` --- Temporarily ban a member.
--   `/dban` --- Delete the replied-to message and ban its sender.
--   `/sban` --- Ban silently.
--   `/unban` --- Remove a ban.
--   `/mute` --- Restrict a member.
--   `/tmute` --- Temporarily mute a member.
--   `/dmute` --- Delete the message and mute its sender.
--   `/smute` --- Mute silently.
--   `/unmute` --- Restore messaging permissions.
--   `/kick` --- Remove a member.
--   `/dkick` --- Delete the message and kick its sender.
--   `/skick` --- Kick silently.
--   `/promote` --- Promote a member.
--   `/demote` --- Remove administrator privileges.
+| Command | Description |
+|---|---|
+| `/ban` | Ban a member |
+| `/tban` | Temporarily ban a member, e.g. `/tban 4m`, `/tban 3h`, `/tban 6d` |
+| `/dban` | Delete the replied-to message and ban its sender |
+| `/sban` | Perform a silent ban |
+| `/unban` | Remove a member's ban |
+| `/mute` | Restrict a member from messaging |
+| `/tmute` | Temporarily mute a member |
+| `/dmute` | Delete the replied-to message and mute its sender |
+| `/smute` | Perform a silent mute |
+| `/unmute` | Restore a member's messaging permissions |
+| `/kick` | Remove a member from the group |
+| `/dkick` | Delete the replied-to message and kick its sender |
+| `/skick` | Perform a silent kick |
+| `/promote` | Promote a member to administrator |
+| `/demote` | Remove a member's administrator privileges |
+| `/adminlist` | Display the administrator list |
+| `/admincache` | Refresh administrator information |
 
-**Warning management**
+### Warning system
 
--   `/warn` --- Issue a warning.
--   `/dwarn` --- Delete the message and issue a warning.
--   `/swarn` --- Issue a silent warning.
--   `/warns` --- View a member's warnings.
--   `/rmwarn` --- Remove a warning.
--   `/resetwarn` --- Reset a member's warnings.
--   `/resetallwarns` --- Reset all warnings in the group.
--   `/warnmode` --- Configure automatic punishment.
--   `/warnlimit` --- Set the warning threshold.
+| Command | Description |
+|---|---|
+| `/warn` | Issue a warning |
+| `/dwarn` | Delete the replied-to message and issue a warning |
+| `/swarn` | Issue a silent warning |
+| `/warns` | View a member's warnings |
+| `/rmwarn` | Remove a warning |
+| `/resetwarn` | Reset a member's warnings |
+| `/resetallwarns` | Reset all warnings in the group |
+| `/warnmode` | Configure the action taken at the warning limit |
+| `/warnlimit` | Set the warning threshold |
 
-**Additional administration**
+Supported warning modes are `ban`, `kick`, and `mute`.
 
--   `/adminlist` --- Display group administrators.
--   `/admincache` --- Refresh administrator information.
--   `/approve` --- Approve a trusted member.
--   `/unapprove` --- Remove approval.
--   `/trust` --- Add a trusted member.
--   `/untrust` --- Remove trusted status.
+### Approval and trust
 
-**Target identification**
+- `/approve` — Approve a member.
+- `/unapprove` — Remove approval.
+- `/trust` — Add a trusted member.
+- `/untrust` — Remove trusted status.
 
-Miss Sona supports:
+### Member targeting
 
--   Reply-based member targeting.
--   Username targeting (`@username`).
--   Numeric Telegram user IDs.
--   Active-user lookup where available.
+The bot description specifies support for:
 
-Reply-based targeting receives the highest priority.
+1. Reply-based targeting (highest priority).
+2. Username targeting, such as `@username`.
+3. Numeric Telegram user IDs.
+4. Active-user lookup where available.
 
-------------------------------------------------------------------------
+---
 
-## 2. 🤖 Telegram Terms of Service Safety Protection
+## 2. 🤖 AI-Assisted Content Moderation
 
-An AI-assisted moderation layer designed to identify potentially harmful
-content and help administrators maintain safer communities.
+Miss Sona includes a layered content-screening design intended to help administrators identify potentially harmful messages.
 
-### Supported moderation categories
+### Moderation categories
 
-  Category                Protection
-  ----------------------- -----------------------------------------------
-  🔞 Adult content        Sexual and NSFW material
-  🚨 Child safety         Child sexual abuse material (CSAM) indicators
-  ⚔️ Violence             Violent threats and harmful content
-  🚫 Hate                 Hate speech and harassment
-  💊 Illegal activities   Illegal drugs and weapons-related content
-  🆘 Self-harm            Self-harm-related content
-  ⚠️ Fraud                Spam, scams, and fraudulent messages
+- Adult, sexual, and NSFW content.
+- Child-safety violations and CSAM indicators.
+- Violence and threats.
+- Hate speech and harassment.
+- Illegal drugs and weapons-related content.
+- Self-harm-related content.
+- Spam, scams, and fraud.
 
-### How it works
+### Detection workflow
 
-Miss Sona uses a layered detection pipeline:
+1. **Keyword and regular-expression checks:** Fast preliminary screening.
+2. **Optional AI moderation:** An open-source model can provide additional classification.
+3. **Threshold evaluation:** The configured default threshold is `0.75`.
+4. **Configured moderation action:** Flagged content may be deleted and logged.
 
-1.  **Keyword and Regex Detection:** Fast preliminary content screening.
-2.  **Optional AI Moderation:** Open-source models for additional
-    content classification.
-3.  **Confidence Threshold:** Configurable moderation threshold, default
-    `0.75`.
-4.  **Automated Action:** Depending on the configured policy, flagged
-    content can be deleted and logged.
+Example notification:
 
-**Example moderation notification:**
-
-``` text
+```text
 ⚠️ Message was deleted as it violates
 Telegram TOS — {reason}.
 
 Please follow Telegram Terms of Service.
 ```
 
-### Available configuration
+### Configuration commands
 
-``` text
+```text
 /tos on
 /tos off
 ```
 
-Protection can be configured independently for each group.
+The protection setting is configurable per group.
 
-**AI models and libraries:**
+### Optional AI dependencies
 
--   Detoxify
--   Hugging Face Transformers
--   KoalaAI/Text-Moderation
+- Hugging Face Transformers
+- Detoxify
+- KoalaAI/Text-Moderation
 
-> Note: Automated moderation is probabilistic, not a guarantee of legal
-> or Telegram policy compliance. False positives and false negatives are
-> possible. Administrators should review moderation decisions and
-> maintain an appropriate appeal process. AI protection is optional.
+> **Important:** AI classification is not perfect. It can produce false positives and false negatives, and it does not certify that a group or bot is compliant with Telegram's Terms of Service or applicable law. Administrators should review enforcement settings and provide a way to handle moderation appeals. AI moderation is optional.
 
-------------------------------------------------------------------------
+---
 
-## 3. 🔒 Smart Security Locks & Anti-Spam
+## 3. 🔒 Security Locks and Anti-Spam
 
-Protect your community from unwanted content, suspicious links, and spam
-activities.
+Configure restrictions to reduce unwanted content and disruptive activity.
 
-### Available lock categories
+### Supported lock types
 
-  Lock         Restricted content
-  ------------ --------------------------
-  `url`        Website URLs
-  `forward`    Forwarded messages
-  `inline`     Inline queries
-  `invite`     Group invitations
-  `sticker`    Stickers
-  `photo`      Photos
-  `video`      Videos
-  `gif`        GIF animations
-  `audio`      Audio files
-  `voice`      Voice messages
-  `document`   Documents
-  `contact`    Contact sharing
-  `location`   Location sharing
-  `game`       Telegram games
-  `rtl`        Right-to-left text
-  `button`     Buttons
-  `command`    Commands
-  `email`      Email addresses
-  `phone`      Phone numbers
-  `bot`        Bot-related restrictions
+| Lock type | Content or activity |
+|---|---|
+| `url` | Website URLs |
+| `forward` | Forwarded messages |
+| `inline` | Inline queries |
+| `invite` | Invite links |
+| `sticker` | Stickers |
+| `photo` | Photos |
+| `video` | Videos |
+| `gif` | GIF animations |
+| `audio` | Audio files |
+| `voice` | Voice messages |
+| `document` | Documents |
+| `contact` | Contact sharing |
+| `location` | Location sharing |
+| `game` | Telegram games |
+| `rtl` | Right-to-left text |
+| `button` | Buttons |
+| `command` | Commands |
+| `email` | Email addresses |
+| `phone` | Phone numbers |
+| `bot` | Bot-related restrictions |
 
 ### Security commands
 
-``` text
+```text
 /lock
 /unlock
 /locks
@@ -238,178 +191,162 @@ activities.
 /cleanservice
 ```
 
-Configure restrictions according to the requirements of each community.
+The available restrictions and their exact behavior depend on the implementation and Telegram permissions granted to the bot.
 
-------------------------------------------------------------------------
+---
 
-## 4. 🧠 AI-OCR Safety Pipeline
+## 4. 🧠 OCR-Assisted Media Safety
 
-Miss Sona extends content screening beyond ordinary text messages.
+The OCR pipeline can extract text from supported images and documents so that extracted text can be checked by the configured safety rules.
 
-Its OCR pipeline can inspect supported images and documents to extract
-readable text for moderation.
+### Processing overview
 
-### Processing pipeline
-
-``` text
-       Incoming Media
-             |
-             v
-       Media Detection
-             |
-             v
-       Image Extraction
-             |
-             v
-      OCR Text Extraction
-             |
-             v
-       Owner Vault Check
-             |
-             v
-       OCR Blacklist Check
-             |
-             v
-       TOS AI Moderation
-             |
-             v
-       Moderation Decision
-             |
-       +-----+------+
-       |            |
-       v            v
-     Allow        Delete
-                    |
-                    v
-               Log Event
+```text
+Incoming image or supported document
+                 |
+                 v
+           Media detection
+                 |
+                 v
+          Image extraction
+                 |
+                 v
+           OCR extraction
+                 |
+                 v
+       Owner vault / blacklist
+                 |
+                 v
+       Optional AI moderation
+                 |
+                 v
+       Apply configured action
+                 |
+                 v
+             Log event
 ```
 
 ### Technologies
 
--   Pillow --- Image processing.
--   Tesseract OCR --- Text extraction.
--   Optional AI moderation --- Additional content analysis.
+- **Pillow:** Image processing.
+- **Tesseract OCR:** Text extraction.
+- **Optional AI model:** Additional content classification.
 
-**Additional capabilities:**
+### Capabilities described for this project
 
--   Image and supported document scanning.
--   OCR blacklist matching.
--   Owner-defined protected-word vault.
--   Moderation event logging.
--   Automatic deletion when configured detection rules are triggered.
--   Files larger than 20 MB are skipped.
+- Scanning supported images and documents.
+- Extracting visible text using OCR.
+- Checking extracted text against an owner-managed vault and OCR blacklist.
+- Passing extracted text to the configured moderation pipeline.
+- Deleting content when configured rules identify a violation.
+- Skipping files larger than 20 MB.
 
-------------------------------------------------------------------------
+OCR and AI results should be treated as automated signals, not definitive legal determinations.
 
-## 5. 👋 Welcome & Goodbye System
+---
 
-Give every new member a personalized introduction.
+## 5. 👋 Welcome and Goodbye Messages
+
+Welcome new members with customized text or supported media, and optionally send goodbye messages when members leave.
 
 ### Features
 
--   Custom welcome messages.
--   Custom goodbye messages.
--   Photo and video welcome media.
--   Per-group configuration.
--   Automatic member-count information.
--   Optional CAPTCHA verification.
+- Custom welcome messages.
+- Custom goodbye messages.
+- Photo and video welcome media.
+- Per-group configuration.
+- Member-count placeholders.
+- Optional CAPTCHA verification.
 
-### Supported placeholders
+### Message placeholders
 
-  Placeholder    Description
-  -------------- --------------------------
-  `{fullname}`   Member's full name
-  `{username}`   Telegram username
-  `{mention}`    Clickable member mention
-  `{id}`         Telegram user ID
-  `{chatname}`   Group name
-  `{count}`      Member count
+| Placeholder | Description |
+|---|---|
+| `{fullname}` | Member's full name |
+| `{username}` | Member's username |
+| `{mention}` | Member mention |
+| `{id}` | Telegram user ID |
+| `{chatname}` | Group name |
+| `{count}` | Member count |
 
 ### Commands
 
-``` text
+```text
 /setwelcome
 /welcome on
 /welcome off
 ```
 
-Reply to supported media with `/setwelcome` to configure media-based
-welcomes.
+To configure supported media, reply to the media with `/setwelcome`.
 
-### CAPTCHA Verification
+### CAPTCHA verification
 
-Miss Sona includes a human-verification workflow:
+The described verification flow includes:
 
--   Verification button: `✅ Verify You Are Human`
--   Verification duration: 120 seconds.
--   Helps reduce automated bot entries.
+- A `✅ Verify You Are Human` button.
+- A 120-second verification period.
+- A check intended to help reduce automated bot entries.
 
-------------------------------------------------------------------------
+---
 
-## 6. 🎯 Filters & Notes Management
+## 6. 🎯 Filters and Notes
 
-Create custom automated responses for frequently used words, phrases,
-and commands.
+Create automatic replies for common words or phrases, and store reusable information for your group.
 
 ### Filters
 
-``` text
+Create a text filter:
+
+```text
 /filter <trigger> <reply>
 ```
 
-You can also reply to supported media using:
+Create a media filter by replying to supported media:
 
-``` text
+```text
 /filter <trigger>
 ```
 
-**Available commands**
+Manage filters:
 
-``` text
+```text
 /filters
 /stop <trigger>
 /stopall
 ```
 
-Each group's filters are stored independently.
+Filters are stored separately for each group.
 
 ### Notes
 
-Save useful information and retrieve it whenever needed.
+Save and retrieve group information:
 
-``` text
+```text
 /setnote <name> <text>
 /getnote <name>
 /getnote #hashtag
 /delnote <name>
 ```
 
-Useful for:
+Example uses include group rules, FAQs, announcements, resources, and frequently shared instructions.
 
--   Group rules.
--   Frequently asked questions.
--   Important announcements.
--   Community resources.
--   Saved instructions.
+---
 
-------------------------------------------------------------------------
+## 7. 🧩 Word Jumble — Stack Emojify
 
-## 7. 🧩 Word Jumble Game --- Stack Emojify
+Miss Sona includes an interactive word-guessing game for community engagement.
 
-Bring some entertainment into your Telegram community with an
-interactive word-guessing game.
+### Feedback symbols
 
-### Game feedback system
-
-  Emoji   Meaning
-  ------- -----------------------------------
-  🎯      Correct character and position
-  🔀      Character exists but is misplaced
-  🚫      Character is absent
+| Symbol | Meaning |
+|---|---|
+| 🎯 | Correct character in the correct position |
+| 🔀 | Character exists but is in the wrong position |
+| 🚫 | Character is absent from the target word |
 
 ### Game commands
 
-``` text
+```text
 /new
 /new4
 /new5
@@ -420,155 +357,136 @@ interactive word-guessing game.
 /endgame
 ```
 
-### Validated word dictionary
+### Dictionary validation
 
-Miss Sona includes an embedded dictionary containing 1,831 words.
+The project description lists the following embedded dictionary counts:
 
-  Word length                    Available words
-  ---------------------------- -----------------
-  4 letters                                  546
-  5 letters                                  648
-  6 letters                                  639
-  **Total of listed counts**           **1,833**
+| Word length | Listed word count |
+|---|---:|
+| 4 letters | 546 |
+| 5 letters | 648 |
+| 6 letters | 639 |
+| **Sum of listed counts** | **1,833** |
 
-> Version note: The individual counts add up to 1,833, whereas the
-> stated total is 1,831. Verify the embedded dictionary before
-> publishing the final count.
+The original project summary also states a total of 1,831 words. These figures do not match, so verify the dictionary in the source file before publishing a definitive total.
 
-Additional validation can use:
+Optional word-validation libraries:
 
--   `wordfreq`
--   `enchant`
+- `wordfreq`
+- `enchant`
 
-The validation system is designed to reject invalid or nonsensical
-guesses such as `bkilsd` and `zzzz`.
+The validation system is intended to reject invalid guesses, including examples such as `bkilsd` and `zzzz`.
 
-------------------------------------------------------------------------
+---
 
-## 8. 🔗 Multi-Group Connection System
+## 8. 🔗 Multi-Group Connection
 
-Manage multiple Telegram communities without repeatedly switching
-between group chats.
+Connect multiple Telegram groups and manage them through the bot's private chat interface.
 
-### How it works
+### Connection workflow
 
-**Step 1 --- Connect your group**
+**Step 1 — Start in the group**
 
-In the target group:
-
-``` text
+```text
 /connect
 ```
 
-The bot performs administrator verification.
+The bot performs an administrator check.
 
-**Step 2 --- Open private chat**
+**Step 2 — Open the bot privately**
 
-Start a conversation with Miss Sona.
+Start a private conversation with Miss Sona.
 
-**Step 3 --- Manage connections**
+**Step 3 — Manage connected groups**
 
-``` text
+```text
 /connect
 /connections
 /disconnect
 ```
 
-### Management capabilities
+### Described capabilities
 
--   List connected groups.
--   Switch between connected communities.
--   Manage group settings through private chat.
--   Disconnect groups when necessary.
--   Resolve the effective group ID for private management operations.
+- List connected groups.
+- Switch between connected groups using inline controls.
+- Manage supported group settings from private chat.
+- Disconnect a group.
+- Resolve the effective group ID for private management operations.
 
-This feature is especially useful for administrators managing multiple
-communities.
-
-------------------------------------------------------------------------
+---
 
 ## 9. ⚙️ Additional Utilities
 
-Miss Sona also includes several tools for everyday group administration.
-
-  Command           Function
-  ----------------- -----------------------------
-  `/all`            Mention group members
-  `/admins`         Mention administrators
-  `/shadowreply`    Shadow-reply functionality
-  `/rules`          Display group rules
-  `/setrules`       Configure group rules
-  `/privaterules`   Private rules workflow
-  `/export`         Export supported bot data
-  `/import`         Import supported bot data
-  `/disable`        Disable supported commands
-  `/id`             Display Telegram IDs
-  `/support`        Display support information
-  `/setlog`         Configure logging
+| Command | Description |
+|---|---|
+| `/all` | Mention group members |
+| `/admins` | Mention group administrators |
+| `/shadowreply` | Use the shadow-reply feature |
+| `/rules` | Display group rules |
+| `/setrules` | Configure group rules |
+| `/privaterules` | Use the private-rules workflow |
+| `/export` | Export supported bot data |
+| `/import` | Import supported bot data |
+| `/disable` | Disable supported commands |
+| `/id` | Display Telegram IDs |
+| `/support` | Display support information |
+| `/setlog` | Configure the logging destination |
 
 ### Mention throttling
 
-To reduce excessive notifications:
+The project description specifies a throttle of **5 mentions per 3 seconds** to help limit excessive notifications.
 
--   Maximum 5 mentions.
--   3-second throttling interval.
+---
 
-------------------------------------------------------------------------
+# 🏗️ Technology Stack
 
-# 🏗️ Technical Architecture
+| Technology | Purpose |
+|---|---|
+| Python | Main programming language |
+| `python-telegram-bot` v20+ | Telegram Bot API framework |
+| `asyncio` | Asynchronous execution |
+| SQLite | Persistent database |
+| SQLite WAL | Write-Ahead Logging |
+| Pillow | Image processing |
+| Tesseract OCR | Text extraction from images |
+| Transformers | Optional AI inference |
+| Detoxify | Optional toxicity classification |
+| Telegram HTML ParseMode | Message formatting |
 
-Miss Sona is built using a lightweight, asynchronous Python
-architecture.
+## Handler groups
 
-### Technology stack
+The described application uses these handler-group constants:
 
-  Technology                 Purpose
-  -------------------------- -------------------------------------
-  Python                     Main programming language
-  python-telegram-bot v20+   Telegram Bot API integration
-  asyncio                    Asynchronous execution
-  SQLite                     Persistent storage
-  SQLite WAL                 Improved concurrent database access
-  Pillow                     Image processing
-  Tesseract                  OCR processing
-  Transformers               Optional AI inference
-  Detoxify                   Optional toxicity detection
-  HTML ParseMode             Telegram message formatting
-
-### Handler architecture
-
-The application uses dedicated handler groups:
-
-``` python
+```python
 GROUP_TRACK = -1
 G_SEC = 0
 G_MAIN = 1
 G_FB = 2
 ```
 
-### Database architecture
+## SQLite configuration
 
-Miss Sona uses SQLite with:
+The project description specifies these database settings:
 
-``` sql
+```sql
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA busy_timeout=10000;
 ```
 
-Database design emphasizes:
+The database design is described as using:
 
--   Group-specific records.
--   Composite primary keys.
--   Chat-scoped queries.
--   Reduced cross-group data exposure.
--   Improved handling of concurrent database operations.
+- `chat_id` scoping for group-specific records.
+- Composite primary keys.
+- Group-filtered database queries.
+- SQLite WAL for improved concurrent access.
 
-### Single-file structure
+## Project layout
 
-``` text
+A suggested repository layout is:
+
+```text
 Miss-Sona/
-│
 ├── miss_sona.py
 ├── requirements.txt
 ├── .env
@@ -577,319 +495,292 @@ Miss-Sona/
 ├── docker-compose.yml
 ├── LICENSE
 ├── README.md
-│
 ├── assets/
 │   └── miss-sona-banner.png
-│
 └── miss_sona.db
 ```
 
-The main bot implementation is contained in:
+The main bot implementation is:
 
-``` text
+```text
 miss_sona.py
 ```
 
-------------------------------------------------------------------------
+The Docker files, environment file, assets, and database should be included only if they are part of your actual repository. Do not commit bot tokens or other secrets.
 
-# 📦 Installation & Deployment
+---
+
+# 📦 Installation
 
 ## Requirements
 
--   Python 3.8 or newer.
--   Telegram Bot Token.
--   Internet connection.
--   Telegram group administrator permissions.
--   Optional Tesseract installation for OCR.
--   Optional AI dependencies for advanced moderation.
+- Python 3.8 or newer, subject to compatibility with the selected dependency versions.
+- A Telegram bot token from [@BotFather](https://t.me/BotFather).
+- Internet access.
+- Administrator permissions in groups where the bot will moderate.
+- Tesseract OCR for OCR functionality.
+- Optional AI dependencies for AI moderation.
 
-### Step 1 --- Clone the repository
+## 1. Clone the repository
 
-``` bash
+Replace the placeholder with your actual repository URL:
+
+```bash
 git clone <YOUR_REPOSITORY_URL>
 cd Miss-Sona
 ```
 
-### Step 2 --- Install dependencies
+## 2. Install Python dependencies
 
-``` bash
+```bash
 pip install -r requirements.txt
 ```
 
-### Step 3 --- Install OCR support
+## 3. Install Tesseract OCR
 
-On Ubuntu/Debian:
+On Ubuntu or Debian:
 
-``` bash
+```bash
 sudo apt update
 sudo apt install tesseract-ocr
 ```
 
-Install Python OCR dependencies if required:
+Install the Python OCR packages if they are not already included in `requirements.txt`:
 
-``` bash
+```bash
 pip install Pillow pytesseract
 ```
 
-### Step 4 --- Install optional AI dependencies
+## 4. Install optional AI dependencies
 
-``` bash
+```bash
 pip install transformers torch detoxify
 ```
 
-The AI dependencies are optional and may require significant RAM, disk
-space, and processing resources.
+AI packages and models can require substantial memory, storage, and processing capacity. Install them only if you intend to enable the corresponding functionality.
 
-### Step 5 --- Configure environment variables
+## 5. Configure environment variables
 
-Create a `.env` file or export the following environment variables.
+Create a `.env` file or configure the variables in your deployment environment:
 
-``` ini
+```ini
 BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
-
 OWNER_ID=YOUR_TELEGRAM_USER_ID
-
 DB_PATH=miss_sona.db
 
 SUPPORT_CHAT_ID=-1001234567890
-
 SUPPORT_LINK=https://t.me/SecretSquadSupport
 
 TOS_AI_MODEL=KoalaAI/Text-Moderation
-
 TOS_AI_THRESHOLD=0.75
 ```
 
-### Configuration reference
+### Environment variable reference
 
-  Variable             Description
-  -------------------- ---------------------------------
-  `BOT_TOKEN`          Telegram bot token (required)
-  `OWNER_ID`           Bot owner's Telegram ID
-  `DB_PATH`            SQLite database location
-  `SUPPORT_CHAT_ID`    Optional moderation log channel
-  `SUPPORT_LINK`       Support community URL
-  `TOS_AI_MODEL`       Optional AI moderation model
-  `TOS_AI_THRESHOLD`   AI moderation threshold
+| Variable | Required? | Purpose |
+|---|---|---|
+| `BOT_TOKEN` | Yes | Telegram bot token |
+| `OWNER_ID` | Optional | Bot owner's Telegram user ID |
+| `DB_PATH` | Optional | SQLite database path |
+| `SUPPORT_CHAT_ID` | Optional | Moderation log chat or channel |
+| `SUPPORT_LINK` | Optional | Support community link |
+| `TOS_AI_MODEL` | Optional | AI moderation model |
+| `TOS_AI_THRESHOLD` | Optional | AI moderation threshold |
 
-### Step 6 --- Run Miss Sona
+The `.env` file is not automatically loaded by Python unless the application or its startup environment loads it. If the project uses `python-dotenv`, ensure that dependency is installed and `load_dotenv()` is called.
 
-``` bash
+## 6. Start the bot
+
+```bash
 python miss_sona.py
 ```
 
-🎉 Your Miss Sona bot is now running!
+If configuration and dependencies are correct, the bot should start polling Telegram for updates.
 
-------------------------------------------------------------------------
+---
 
 # 🐳 Docker Deployment
 
-Miss Sona can also be deployed using Docker.
+If the repository includes a working `Dockerfile` and `docker-compose.yml`, you can use Docker Compose.
 
-### Start the application
+### Start
 
-``` bash
+```bash
 docker compose up -d
 ```
 
-### View logs
+### Follow logs
 
-``` bash
+```bash
 docker compose logs -f
 ```
 
-### Stop the application
+### Stop
 
-``` bash
+```bash
 docker compose down
 ```
 
-Ensure your Docker configuration preserves the SQLite database and
-environment variables between restarts.
+Make sure the Docker configuration passes the required environment variables and mounts persistent storage for the SQLite database. The OCR system package must also be installed in the image if OCR is enabled.
 
-------------------------------------------------------------------------
+---
 
-# 📋 Command Reference
+# 📋 Quick Command Reference
 
-A quick reference to the major commands available in Miss Sona.
+| Category | Commands |
+|---|---|
+| Moderation | `/ban`, `/tban`, `/dban`, `/sban`, `/unban`, `/mute`, `/tmute`, `/unmute`, `/kick` |
+| Warnings | `/warn`, `/dwarn`, `/swarn`, `/warns`, `/rmwarn`, `/resetwarn`, `/resetallwarns` |
+| Administration | `/promote`, `/demote`, `/adminlist`, `/admincache` |
+| Approval and trust | `/approve`, `/unapprove`, `/trust`, `/untrust` |
+| Security | `/lock`, `/unlock`, `/locks`, `/locktypes`, `/allowlist`, `/blocklist` |
+| Flood control | `/setflood`, `/setfloodmode` |
+| Welcome | `/setwelcome`, `/welcome on`, `/welcome off` |
+| Filters | `/filter`, `/filters`, `/stop`, `/stopall` |
+| Notes | `/setnote`, `/getnote`, `/delnote` |
+| AI moderation | `/tos on`, `/tos off` |
+| Word game | `/new`, `/new4`, `/new5`, `/new6`, `/word`, `/game`, `/top`, `/endgame` |
+| Multi-group | `/connect`, `/connections`, `/disconnect` |
+| Utilities | `/all`, `/admins`, `/rules`, `/setrules`, `/privaterules`, `/export`, `/import`, `/disable`, `/id` |
+| Support | `/support`, `/setlog` |
 
-  Category         Commands
-  ---------------- ----------------------------------------------------------
-  Moderation       `/ban`, `/tban`, `/mute`, `/tmute`, `/kick`, `/unban`
-  Warnings         `/warn`, `/warns`, `/rmwarn`, `/resetwarn`
-  Administration   `/promote`, `/demote`, `/adminlist`
-  Approval         `/approve`, `/unapprove`, `/trust`, `/untrust`
-  Security         `/lock`, `/unlock`, `/locks`, `/allowlist`, `/blocklist`
-  Welcome          `/setwelcome`, `/welcome`
-  Filters          `/filter`, `/filters`, `/stop`, `/stopall`
-  Notes            `/setnote`, `/getnote`, `/delnote`
-  AI Protection    `/tos on`, `/tos off`
-  Word Game        `/new`, `/new4`, `/new5`, `/new6`, `/game`, `/top`
-  Connections      `/connect`, `/connections`, `/disconnect`
-  Utilities        `/rules`, `/setrules`, `/export`, `/import`, `/id`
-  Support          `/support`, `/setlog`
+For the full command list and usage instructions, use:
 
-For the complete command list and usage instructions:
-
-``` text
+```text
 /help
 ```
 
-or
+or:
 
-``` text
+```text
 /start
 ```
 
-------------------------------------------------------------------------
+---
 
-# 🔐 Privacy, Security & Group Isolation
+# 🔐 Privacy and Group Isolation
 
-Security and data isolation are fundamental design priorities.
+Group isolation is a core design objective of Miss Sona.
 
-### Group isolation
+### Database isolation
 
-Miss Sona follows a chat-scoped database architecture.
+According to the project design:
 
--   Every group-specific table includes `chat_id`.
--   Group-specific database queries filter by `chat_id`.
--   Filters, notes, and moderation records are isolated between
-    communities.
--   Private management operations resolve the appropriate effective
-    group ID.
+- Group-specific tables include a `chat_id` field.
+- Group-specific queries filter records by `chat_id`.
+- Filters, notes, and moderation data are scoped to their respective groups.
+- Private management commands resolve the effective group ID before performing group operations.
 
 ### Database reliability
 
--   SQLite WAL mode.
--   Configurable busy timeout.
--   Composite database keys.
--   Persistent storage.
+The database configuration includes:
 
-### Message formatting security
+- SQLite WAL mode.
+- A 10-second busy timeout.
+- Normal synchronous mode.
+- Composite keys for scoped records.
 
-The bot uses Telegram HTML ParseMode and `html.escape()` to reduce HTML
-injection and formatting problems when handling user-provided text.
+### Safe message formatting
 
-### Logging policy
+The project description specifies Telegram HTML ParseMode and `html.escape()` for user-provided text. Ensure every untrusted value inserted into HTML-formatted Telegram messages is escaped appropriately.
 
-Moderation logs are sent to the configured `SUPPORT_CHAT_ID`.
+### Logging
 
-Log messages use the prefix:
+When `SUPPORT_CHAT_ID` is configured, moderation logs are directed to that chat or channel.
 
-``` text
+The described log prefix is:
+
+```text
 🛡️ Miss Sona Log | The Secret Squad
 ```
 
-No logging channel is required if logging is not configured.
-
 ### Owner controls
 
-Certain privileged operations, including protected vault management and
-bypass functionality, are restricted to the configured owner.
+Owner-only functionality is described for protected vault management and bypass controls. Keep the owner ID private and verify authorization checks in the implementation.
 
-> Administrators should protect their bot token, restrict access to
-> database backups, configure appropriate Telegram permissions, and
-> follow applicable privacy and data-retention requirements.
+### Deployment security checklist
 
-------------------------------------------------------------------------
+- Never publish your bot token.
+- Keep `.env` out of version control.
+- Restrict access to the database and backups.
+- Give the bot only the Telegram permissions it needs.
+- Review automated moderation actions.
+- Set an appropriate data-retention policy.
+- Protect log channels and administrative commands.
 
-# 🎨 Branding & Identity
+---
 
-```{=html}
-<p align="center">
-```
-`<b>`{=html}👑 MISS SONA`</b>`{=html} `<br>`{=html} `<i>`{=html}The
-Secret Squad Guardian`</i>`{=html} `<br>`{=html}`<br>`{=html}
-`<b>`{=html}Secure • Smart • Powerful • Always There`</b>`{=html}
-```{=html}
-</p>
-```
-Miss Sona represents a modern approach to Telegram community management,
-combining automated safety, practical administration, and community
-engagement.
+# 🎨 Branding and Identity
+
+## 👑 Miss Sona — The Secret Squad Guardian
+
+**Secure • Smart • Powerful • Always There**
+
+Miss Sona brings together community protection, automated administration, and interactive features in one Telegram bot.
 
 ### Our philosophy
 
--   🛡️ Protect communities.
--   🤖 Automate repetitive administration.
--   🔐 Respect group privacy.
--   ⚡ Keep management efficient.
--   💜 Make Telegram communities more enjoyable.
+- 🛡️ Protect communities.
+- 🤖 Automate repetitive administration.
+- 🔐 Respect group privacy.
+- ⚡ Keep management efficient.
+- 💜 Make Telegram communities more enjoyable.
 
-------------------------------------------------------------------------
+---
 
-# 📞 Support & Community
+# 📞 Support and Community
 
-```{=html}
-<p align="center">
-```
-`<b>`{=html}Built with ❤️ by The Secret Squad`</b>`{=html}
-```{=html}
-</p>
-```
-  --------------------------------------------------------------------------------------------
-  Platform                            Link
-  ----------------------------------- --------------------------------------------------------
-  Telegram Support                    [@SecretSquadSupport](https://t.me/SecretSquadSupport)
+**Built with ❤️ by The Secret Squad**
 
-  GitHub                              Open an issue in the project repository
+- **Telegram Support:** [@SecretSquadSupport](https://t.me/SecretSquadSupport)
+- **GitHub Issues:** Open an issue in the project repository.
+- **License:** MIT
 
-  License                             MIT
-  --------------------------------------------------------------------------------------------
+For technical assistance, bug reports, feature requests, and suggestions, contact the support community.
 
-For technical assistance, bug reports, feature suggestions, and
-improvements, contact the support community.
-
-------------------------------------------------------------------------
+---
 
 # 🧾 Project Information
 
-  Property           Details
-  ------------------ ---------------------------
-  Project            Miss Sona
-  Identity           The Secret Squad Guardian
-  Version            v6.0 TOS-AI
-  Release date       18 November 2026
-  Main file          `miss_sona.py`
-  Architecture       Single-file application
-  Approximate size   1,770 lines
-  Language           Python
-  Framework          python-telegram-bot v20+
-  Database           SQLite WAL
-  Processing         asyncio
-  AI moderation      Optional
-  OCR                Optional
-  License            MIT
+| Property | Details |
+|---|---|
+| Project | Miss Sona |
+| Identity | The Secret Squad Guardian |
+| Version | v6.0 TOS-AI |
+| Release date | 18 November 2026 |
+| Main file | `miss_sona.py` |
+| Architecture | Single-file application |
+| Approximate source size | 1,770 lines |
+| Language | Python |
+| Framework | `python-telegram-bot` v20+ |
+| Database | SQLite WAL |
+| Async processing | `asyncio` |
+| AI moderation | Optional |
+| OCR | Optional |
+| License | MIT |
 
-------------------------------------------------------------------------
+---
 
 # 📜 License
 
-This project is distributed under the **MIT License**.
+Miss Sona is distributed under the **MIT License**.
 
-You are permitted to use, modify, distribute, and adapt the software in
-accordance with the license terms.
+You may use, copy, modify, merge, publish, distribute, sublicense, and sell copies of the software in accordance with the terms of the license.
 
-See the `LICENSE` file for complete details.
+See the [`LICENSE`](LICENSE) file for the complete license text.
 
-------------------------------------------------------------------------
+---
 
-```{=html}
-<p align="center">
-```
-👑 `<b>`{=html}THE SECRET SQUAD`</b>`{=html} `<br>`{=html}
-`<i>`{=html}BUILD • MANAGE • PROTECT`</i>`{=html}
-`<br>`{=html}`<br>`{=html} `<b>`{=html}Miss Sona --- Your Community, Our
-Responsibility.`</b>`{=html} `<br>`{=html}`<br>`{=html} Made with ❤️ for
-Telegram communities.
-```{=html}
-</p>
-```
-```{=html}
-<p align="center">
-```
-`<sub>`{=html}© 2026 The Secret Squad. All rights reserved under the
-applicable MIT License terms.`</sub>`{=html}
-```{=html}
-</p>
-```
+<div align="center">
+
+## 👑 THE SECRET SQUAD
+
+**BUILD • MANAGE • PROTECT**
+
+### Miss Sona — Your Community, Our Responsibility.
+
+Made with ❤️ for Telegram communities.
+
+*© 2026 The Secret Squad. Released under the MIT License.*
+
+</div>
