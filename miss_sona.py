@@ -383,6 +383,11 @@ class Database:
         cur.execute("""CREATE TABLE IF NOT EXISTS warns_settings(chat_id INTEGER PRIMARY KEY, limit_num INTEGER DEFAULT 3, mode TEXT DEFAULT 'ban')""")
         cur.execute("""CREATE TABLE IF NOT EXISTS support_logs(log_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, actor_id INTEGER, action TEXT, target_id INTEGER, detail TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS global_bans(user_id INTEGER PRIMARY KEY, reason TEXT, banned_by INTEGER, banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # Game ranking: global + per-group
+        cur.execute("""CREATE TABLE IF NOT EXISTS group_leaderboard(chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, wins INTEGER DEFAULT 0, games_played INTEGER DEFAULT 0, PRIMARY KEY(chat_id, user_id))""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS game_history(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, user_id INTEGER, username TEXT, word TEXT, length INTEGER, won INTEGER, attempts INTEGER, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        # Chatfight: message activity ranking
+        cur.execute("""CREATE TABLE IF NOT EXISTS chatfight_scores(chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, fullname TEXT, msg_count INTEGER DEFAULT 0, last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(chat_id, user_id))""")
         for col, typ in [("guesses_json","TEXT DEFAULT '[]'"),("board_msg_id","INTEGER")]:
             try: cur.execute(f"ALTER TABLE games ADD COLUMN {col} {typ}")
             except: pass
@@ -470,6 +475,38 @@ class Database:
         else:
             rows=await self._exec("SELECT chat_id, actor_id, action, target_id, detail, timestamp FROM support_logs WHERE action LIKE 'BAN%' OR action LIKE 'MUTE%' OR action LIKE 'KICK%' OR action LIKE 'WARN%' ORDER BY timestamp DESC LIMIT ?",(limit,),fetch="all")
         return rows or []
+    # ── Game ranking (global + per-group) ──
+    async def record_game(self, chat_id, user_id, username, word, length, won, attempts):
+        # Global leaderboard
+        if won:
+            await self.add_win(user_id, username)
+        else:
+            await self.add_played(user_id, username)
+        # Per-group leaderboard
+        await self._exec("INSERT INTO group_leaderboard(chat_id,user_id,username,wins,games_played) VALUES(?,?,?,1,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, wins=wins+1, games_played=games_played+1",(chat_id,user_id,username)) if won else await self._exec("INSERT INTO group_leaderboard(chat_id,user_id,username,wins,games_played) VALUES(?,?,?,0,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, games_played=games_played+1",(chat_id,user_id,username))
+        # History
+        await self._exec("INSERT INTO game_history(chat_id,user_id,username,word,length,won,attempts) VALUES(?,?,?,?,?,?,?)",(chat_id,user_id,username,word,length,1 if won else 0, attempts))
+
+    async def get_group_top(self, chat_id, limit=10):
+        rows=await self._exec("SELECT user_id, username, wins, games_played FROM group_leaderboard WHERE chat_id=? ORDER BY wins DESC, games_played ASC LIMIT ?",(chat_id,limit),fetch="all")
+        return rows or []
+    async def get_user_top_groups(self, user_id, limit=10):
+        rows=await self._exec("SELECT chat_id, wins, games_played FROM group_leaderboard WHERE user_id=? ORDER BY wins DESC LIMIT ?",(user_id,limit),fetch="all")
+        return rows or []
+    async def get_user_game_stats(self, user_id):
+        grow=await self._exec("SELECT username, wins, games_played FROM leaderboard WHERE user_id=?",(user_id,),fetch="one")
+        if not grow: return None
+        return {"username":grow[1], "wins":grow[2], "played":grow[3] if len(grow)>3 else 0}
+
+    # ── Chatfight (message activity ranking) ──
+    async def bump_chatfight(self, chat_id, user_id, username, fullname):
+        await self._exec("INSERT INTO chatfight_scores(chat_id,user_id,username,fullname,msg_count,last_seen) VALUES(?,?,?,?,1,CURRENT_TIMESTAMP) ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, fullname=excluded.fullname, msg_count=msg_count+1, last_seen=CURRENT_TIMESTAMP",(chat_id,user_id,username,fullname))
+    async def get_chatfight_top(self, chat_id, limit=15):
+        rows=await self._exec("SELECT user_id, username, fullname, msg_count FROM chatfight_scores WHERE chat_id=? ORDER BY msg_count DESC LIMIT ?",(chat_id,limit),fetch="all")
+        return rows or []
+    async def get_user_chatfight(self, chat_id, user_id):
+        row=await self._exec("SELECT msg_count FROM chatfight_scores WHERE chat_id=? AND user_id=?",(chat_id,user_id),fetch="one")
+        return row[0] if row else 0
     async def check_global(self, text):
         words=await self.list_global_words(); low=text.lower()
         for w in words:
@@ -621,6 +658,44 @@ async def resolve_target(update, context) -> Optional[Tuple[int,str]]:
         return None
     return None
 
+def get_reason_from_args(update, context, default="Banned"):
+    """Extract reason handling reply vs @username vs numeric ID."""
+    if not context.args:
+        return default
+    msg=update.effective_message
+    # If replying, all args are reason (target from reply)
+    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+        return " ".join(context.args) if context.args else default
+    # Not reply: first arg is target, rest is reason
+    if len(context.args) <= 1:
+        return default
+    return " ".join(context.args[1:])
+
+def get_mute_reason_and_until(update, context):
+    """Parse mute args: target + optional reason + optional time (1m/1h)."""
+    if not context.args:
+        return "Muted", None
+    # Last arg might be duration
+    last = context.args[-1]
+    dur = parse_duration(last)
+    if dur:
+        until = datetime.datetime.now(datetime.timezone.utc)+dur
+        # If reply, reason is args[:-1]
+        msg=update.effective_message
+        if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+            reason = " ".join(context.args[:-1]) if len(context.args)>1 else "Muted"
+        else:
+            reason = " ".join(context.args[1:-1]) if len(context.args)>2 else "Muted"
+        if not reason:
+            reason="Muted"
+        return reason, until
+    # No duration
+    msg=update.effective_message
+    if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+        return " ".join(context.args) if context.args else "Muted", None
+    return " ".join(context.args[1:]) if len(context.args)>1 else "Muted", None
+
+
 async def send_temp_notice(ctx, chat_id, text, ttl=ILLEGAL_NOTICE_TTL):
     try:
         m=await ctx.bot.send_message(chat_id,text,parse_mode=ParseMode.HTML)
@@ -747,11 +822,19 @@ async def cmd_ban(update,context):
     if OWNER_ID and uid==OWNER_ID: await update.effective_message.reply_text("Can't ban owner"); return
     if await is_admin(update,context,uid): await update.effective_message.reply_text("Can't ban admin"); return
     cmd=update.effective_message.text.split()[0].split("@")[0].lstrip("/").lower()
-    reason=" ".join(context.args[1:]) if len(context.args)>1 else "Banned"
+    reason=get_reason_from_args(update, context, "Banned")
     until=None
     if cmd=="tban" or (context.args and len(context.args)>=1 and parse_duration(context.args[-1])):
         dur=parse_duration(context.args[-1]) if context.args else None
-        if dur: until=datetime.datetime.now(datetime.timezone.utc)+dur; reason=" ".join(context.args[1:-1]) if len(context.args)>2 else "Temp ban"
+        if dur:
+            until=datetime.datetime.now(datetime.timezone.utc)+dur
+            # Re-extract reason excluding duration suffix
+            msg=update.effective_message
+            if msg and msg.reply_to_message and msg.reply_to_message.from_user:
+                reason=" ".join(context.args[:-1]) if len(context.args)>1 else "Temp ban"
+            else:
+                reason=" ".join(context.args[1:-1]) if len(context.args)>2 else "Temp ban"
+            if not reason: reason="Temp ban"
     try:
         if until: await context.bot.ban_chat_member(cid,uid,until_date=until)
         else: await context.bot.ban_chat_member(cid,uid)
@@ -770,7 +853,7 @@ async def cmd_unban(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Usage: /unban <@username|ID>"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /unban <@username|ID> — supports reply/@username/ID"); return
     uid,name=tgt
     try: await context.bot.unban_chat_member(cid,uid); await update.effective_message.reply_html(f"✅ Unbanned {mention_html(uid,name)}"); await log_to_support(context,f"UNBAN {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Unban failed: {e}")
@@ -808,7 +891,7 @@ async def cmd_unmute(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Usage: /unmute <@username|ID>"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /unmute <@username|ID> — supports reply/@username/ID"); return
     uid,name=tgt
     try: await context.bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=True,can_send_media_messages=True,can_send_other_messages=True,can_add_web_page_previews=True)); await update.effective_message.reply_html(f"🔊 Unmuted {mention_html(uid,name)}"); await log_to_support(context,f"UNMUTE {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Unmute failed: {e}")
@@ -831,7 +914,7 @@ async def cmd_promote(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Reply or /promote <@username|ID>"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /promote <@username|ID> — supports reply/@username/ID"); return
     uid,name=tgt
     try: await context.bot.promote_chat_member(cid,uid,can_delete_messages=True,can_restrict_members=True,can_pin_messages=True); await update.effective_message.reply_html(f"⬆️ Promoted {mention_html(uid,name)}"); await log_to_support(context,f"PROMOTE {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Promote failed: {e}")
@@ -842,7 +925,7 @@ async def cmd_demote(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Reply or /demote <@username|ID>"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /demote <@username|ID> — supports reply/@username/ID"); return
     uid,name=tgt
     try: await context.bot.promote_chat_member(cid,uid,can_delete_messages=False,can_restrict_members=False,can_pin_messages=False); await update.effective_message.reply_html(f"⬇️ Demoted {mention_html(uid,name)}"); await log_to_support(context,f"DEMOTE {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Demote failed: {e}")
@@ -852,10 +935,10 @@ async def cmd_warn(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Usage: /warn <@username|ID> [reason]"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /warn <@username|ID> [reason] — supports reply/@username/ID"); return
     uid,name=tgt
     if await is_admin(update,context,uid): await update.effective_message.reply_text("Can't warn admin"); return
-    reason=" ".join(context.args[1:]) if len(context.args)>1 else "No reason"
+    reason=get_reason_from_args(update, context, "No reason")
     count=await db.add_warn(cid,uid,reason)
     limit,mode=await db.get_warns_settings(cid)
     await update.effective_message.reply_html(f"⚠️ Warned {mention_html(uid,name)} ({count}/{limit}) <i>{esc(reason)}</i>")
@@ -935,7 +1018,7 @@ async def cmd_approve(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Reply or /approve <@username|ID>"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /approve <@username|ID> — supports reply/@username/ID"); return
     uid,name=tgt; await db.trust(cid,uid,update.effective_user.id); await update.effective_message.reply_html(f"✅ Approved {mention_html(uid,name)}"); await log_to_support(context,f"APPROVE {uid}",cid,update.effective_user.id,uid)
 async def cmd_unapprove(update,context):
     if not await is_admin(update,context): await update.effective_message.reply_text("🚫 Only admins."); return
@@ -1521,6 +1604,8 @@ async def track_activity(update,context):
     if not update.effective_chat or not update.effective_user or update.effective_user.is_bot: return
     if update.effective_chat.type=="private": return
     await db.upsert_active(update.effective_chat.id,update.effective_user.id,update.effective_user.username,update.effective_user.full_name)
+    try: await db.bump_chatfight(update.effective_chat.id,update.effective_user.id,update.effective_user.username,update.effective_user.full_name)
+    except: pass
     if update.effective_message and (update.effective_message.new_chat_members or update.effective_message.left_chat_member):
         s=await db.get_settings(update.effective_chat.id)
         if s["cleanservice"]:
@@ -1723,9 +1808,81 @@ async def cmd_gamestatus(update,context):
     await update.effective_message.reply_html((board + f"\n\n<b>Starter:</b> <code>{s}</code> | <b>Attempts:</b> {a}"))
 
 async def cmd_top(update,context):
+    # Global top (all groups) — uses leaderboard
     rows=await db.top_players(10)
     if not rows: await update.effective_message.reply_text("No wins yet. /new"); return
-    lines=["🏆 <b>Top Players</b>"]+[f"{i}. {esc(uname or str(uid))} — {wins} win{'s' if wins!=1 else ''}" for i,(uid,uname,wins) in enumerate(rows,1)]
+    lines=["🏆 <b>Global Top Players — All Groups</b>"]+[f"{i}. {esc(uname or str(uid))} — {wins} win{'s' if wins!=1 else ''}" for i,(uid,uname,wins) in enumerate(rows,1)]
+    await update.effective_message.reply_html("\n".join(lines))
+
+async def cmd_group_top(update,context):
+    cid=await effective_chat_id(update,context)
+    if not cid: return
+    rows=await db.get_group_top(cid, 15)
+    if not rows: await update.effective_message.reply_text("No games in this group yet. /new to start!"); return
+    try: chat_title=esc((await context.bot.get_chat(cid)).title or str(cid))
+    except: chat_title=str(cid)
+    lines=[f"🏆 <b>Group Top — {chat_title}</b> (this group only)"]
+    for i,(uid,uname,wins,played) in enumerate(rows,1):
+        lines.append(f"{i}. {esc(uname or str(uid))} — {wins} wins / {played} played")
+    await update.effective_message.reply_html("\n".join(lines))
+
+async def cmd_mystats(update,context):
+    # Show user's global + per-group stats — e.g., dhanush in 3 groups
+    tgt=await resolve_target(update,context)
+    if tgt:
+        uid, name=tgt
+    else:
+        uid=update.effective_user.id; name=update.effective_user.full_name
+    # Global stats
+    grow=await db._exec("SELECT username, wins, games_played FROM leaderboard WHERE user_id=?",(uid,),fetch="one")
+    if not grow:
+        await update.effective_message.reply_html(f"📊 No game data for {mention_html(uid,name)} yet. Play /new!")
+        return
+    username, wins, played = grow[0], grow[1], grow[2]
+    # Per-group breakdown
+    groups=await db.get_user_top_groups(uid, 10)
+    lines=[
+        f"📊 <b>Game Stats — {esc(name)}</b> {mention_html(uid,name)}",
+        f"🌐 <b>Global:</b> {wins} wins / {played} games",
+    ]
+    if groups:
+        lines.append(f"\n🏘 <b>Top Groups for {esc(name)} (per-group ranking):</b>")
+        for idx,(chat_id, gwins, gplayed) in enumerate(groups,1):
+            try: ct=await context.bot.get_chat(chat_id); ct_title=esc(ct.title or str(chat_id))
+            except: ct_title=str(chat_id)
+            lines.append(f"{idx}. {ct_title} — <code>{chat_id}</code> → {gwins} wins / {gplayed} played")
+        # Also show message activity rank for context
+        lines.append(f"\n<i>Use /chatfight to see activity ranking in this group.</i>")
+    else:
+        lines.append("\n<i>No per-group games yet — play in a group with /new</i>")
+    # Recent history
+    hist=await db._exec("SELECT chat_id, word, won, attempts, timestamp FROM game_history WHERE user_id=? ORDER BY timestamp DESC LIMIT 5",(uid,),fetch="all")
+    if hist:
+        lines.append("\n📜 <b>Recent games:</b>")
+        for chat_id, word, won, atts, ts in hist:
+            lines.append(f"• <code>{ts or ''}</code> [{chat_id}] {esc(word)} — {'Won' if won else 'Lost'} in {atts}")
+    await update.effective_message.reply_html("\n".join(lines))
+
+async def cmd_chatfight(update,context):
+    cid=await effective_chat_id(update,context)
+    if not cid: return
+    rows=await db.get_chatfight_top(cid, 15)
+    if not rows: await update.effective_message.reply_text("No activity yet — chat to rank!"); return
+    try: chat_title=esc((await context.bot.get_chat(cid)).title or str(cid))
+    except: chat_title=str(cid)
+    lines=[f"⚔️ <b>Chatfight — Most Active in {chat_title}</b>\n<i>Ranked by messages</i>"]
+    for i,(uid, uname, fname, cnt) in enumerate(rows,1):
+        # Medal
+        medal="🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else f"{i}."
+        lines.append(f"{medal} {esc(fname or uname or str(uid))} — {cnt} msgs {mention_html(uid, fname or uname or str(uid))}")
+    # Show requester's rank
+    if update.effective_user:
+        mycnt=await db.get_user_chatfight(cid, update.effective_user.id)
+        if mycnt:
+            # Find rank
+            all_rows=await db.get_chatfight_top(cid, 100)
+            rank=next((idx for idx,(uid,_,_,_) in enumerate(all_rows,1) if uid==update.effective_user.id), None)
+            if rank: lines.append(f"\n👤 You: rank #{rank} with {mycnt} msgs")
     await update.effective_message.reply_html("\n".join(lines))
 
 async def handle_wordle(update,context):
@@ -1756,11 +1913,12 @@ async def handle_wordle(update,context):
     await db.bump_attempts(cid)
     board=Emojify.stack_emojify(secret, guesses, length)
     if txt.lower()==secret.lower():
-        await db.add_win(update.effective_user.id, (update.effective_user.username if isinstance(update.effective_user.username, str) else None)); await db.stop_game(cid)
+        await db.record_game(cid, update.effective_user.id, (update.effective_user.username if isinstance(update.effective_user.username, str) else update.effective_user.full_name), secret, length, True, len(guesses))
+        await db.stop_game(cid)
         await msg.reply_html(board + f"\n\n🎉 <b>Correct!</b> {mention_html(update.effective_user.id,update.effective_user.full_name)} guessed <code>{esc(secret.upper())}</code> in {len(guesses)} tries!")
         await log_to_support(context,f"WORDLE WIN {secret} by {update.effective_user.id}",cid,update.effective_user.id)
     else:
-        await db.add_played(update.effective_user.id, (update.effective_user.username if isinstance(update.effective_user.username, str) else None))
+        # intermediate guess — not counted until game ends
         try:
             if bid:
                 await context.bot.edit_message_text(chat_id=cid, message_id=bid, text=(board), parse_mode=ParseMode.HTML)
@@ -1895,8 +2053,9 @@ async def cmd_start(update,context):
     txt = (
         "✨ <b>Miss Sona — Your ultimate group Guardian</b> ✨\n\n"
         "Used open source ai + industrial modules\n\n"
+        "Made with emojify love by the secret squad"
     )
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Help", callback_data="help_main")]])
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Help", callback_data="help_main"), InlineKeyboardButton("🎮 Game", callback_data="game_menu")]])
     await update.effective_message.reply_html(branded_start(txt), reply_markup=kb)
 
 async def cmd_help(update,context):
@@ -1909,7 +2068,11 @@ HELP_MEMBER_TEXT = (
     "• <code>/rules</code> — view group rules\n"
     "• <code>/adminlist</code> — list admins\n"
     "• <code>/id</code> — get own/group ID\n"
-    "• <code>/top</code> — leaderboard\n"
+    "• <b>Game:</b> <code>/new</code> <code>/new4</code> <code>/new5</code> <code>/new6</code> — start word game\n"
+    "• <code>/top</code> — global top (all groups)\n"
+    "• <code>/gtop</code> — group top (this group ranking)\n"
+    "• <code>/mystats</code> — your game stats + top groups (e.g., dhanush in 3 groups shows best groups)\n"
+    "• <code>/chatfight</code> — most active users by messages in this group\n"
     "• <code>/support</code> — support link\n"
     "\n<i>All other commands require admin/owner powers.</i>"
 )
@@ -1921,11 +2084,12 @@ HELP_ADMIN_TEXT = (
     "<code>/ban @user spam</code> | <code>/ban 123456789 reason</code> | reply <code>/ban reason</code>\n"
     "If you lack the power, bot replies:\n"
     "<i>🚫 You don't have the power... Please contact the group owner.</i>\n\n"
-    "• <b>Restrict</b> (<code>can_restrict_members</code>) → <code>/ban</code> <code>/tban</code> <code>/dban</code> <code>/sban</code> <code>/unban</code> <code>/mute</code> <code>/tmute</code> <code>/dmute</code> <code>/smute</code> <code>/unmute</code> <code>/kick</code> <code>/warn</code> <code>/rmwarn</code>\n"
+    "• <b>Restrict</b> (<code>can_restrict_members</code>) → <code>/ban</code> <code>/tban</code> <code>/dban</code> <code>/sban</code> <code>/unban</code> <code>/mute</code> <code>/tmute</code> <code>/dmute</code> <code>/smute</code> <code>/unmute</code> <code>/kick</code> <code>/warn</code> <code>/rmwarn</code> <code>/resetwarn</code>\n"
     "• <b>Delete</b> (<code>can_delete_messages</code>) → <code>/lock</code> <code>/unlock</code> <code>/locks</code> <code>/allowlist</code> <code>/blocklist</code> <code>/setflood</code>\n"
     "• <b>Promote</b> (<code>can_promote_members</code>) → <code>/promote</code> <code>/demote</code>\n"
-    "• <b>Change Info</b> (<code>can_change_info</code>) → <code>/setwelcome</code> <code>/setrules</code> <code>/filter</code> <code>/note</code> <code>/setgoodbye</code> <code>/welcome</code>\n"
-    "• <b>Info</b> → <code>/warns</code> <code>/adminlist</code> <code>/logs</code> (own group only)\n"
+    "• <b>Change Info</b> (<code>can_change_info</code>) → <code>/setwelcome</code> <code>/setrules</code> <code>/filter</code> <code>/note</code> <code>/setgoodbye</code> <code>/welcome</code> — checks can_change_info\n"
+    "• <b>Game Admin:</b> <code>/endgame</code> — end word game\n"
+    "• <b>Info</b> → <code>/warns</code> <code>/adminlist</code> <code>/logs</code> <code>/banlogs</code> (own group only)\n"
     "\n<i>All reasons are saved — Group Owner sees their group's logs only, Bot Owner sees all.</i>\n"
     "<i>Owner gives powers via Group → Info → Administrators → edit rights.</i>"
 )
@@ -1934,14 +2098,13 @@ HELP_OWNER_TEXT = (
     "👑 <b>Group Owner Commands</b> — group creator only\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/addbword &lt;word&gt;</code> / <code>/rmbword</code> / <code>/listbwords</code> — banned words (per-group, only this group)\n"
-    "• <code>/fban</code> <code>&lt;@user|ID&gt;</code> [reason] — federation global ban (reply/@/ID)\n"
+    "• <code>/fban</code> <code>&lt;@user|ID&gt;</code> [reason] — federation ban (reply/@/ID)\n"
     "• <code>/unfban</code> / <code>/listfbans</code>\n"
-    "• <code>/logs</code> / <code>/modlogs</code> — view this group's mod logs with reasons (isolated per-group)\n"
-    "• <code>/banlogs</code> — ban/mute/kick/warn history with reasons\n"
-    "• <code>/setlog &lt;chat_id&gt;</code> — set log channel\n"
-    "• <code>/export</code> / <code>/import</code> — backup\n"
-    "• <code>/disable</code> / <code>/enable</code>\n"
-    "\n<i>Bot Owner sees all groups' logs; Group Owner sees only their group's.</i>"
+    "• <code>/logs</code> / <code>/modlogs</code> / <code>/banlogs</code> — view logs with reasons (per-group isolated, Bot Owner sees all)\n"
+    "• <b>Game Owner:</b> <code>/gtop</code> group top, <code>/mystats</code> shows user's top groups (e.g., dhanush in 3 groups)\n"
+    "• <code>/chatfight</code> — activity ranking per group\n"
+    "• <code>/setlog &lt;chat_id&gt;</code> / <code>/export</code> / <code>/import</code> / <code>/disable</code>\n"
+    "\n<i>Bot Owner sees all; Group Owner sees only their group's data.</i>"
 )
 
 async def cb_help(update,context):
@@ -1971,6 +2134,127 @@ async def cb_help(update,context):
         kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="help_main")]])
         try: await q.edit_message_text(HELP_OWNER_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
         except: await q.message.reply_html(HELP_OWNER_TEXT, reply_markup=kb)
+
+# ── Game Button Menu (near Help) — any user can start/control ──
+async def cb_game(update,context):
+    q=update.callback_query
+    if not q: return
+    data=q.data
+    try: await q.answer()
+    except: pass
+
+    # Helper to get cid via connection or group
+    async def get_cid():
+        cid=await effective_chat_id(update,context)
+        return cid
+
+    if data=="game_menu":
+        kb=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🆕 New 4", callback_data="game_new4"), InlineKeyboardButton("🆕 New 5", callback_data="game_new5"), InlineKeyboardButton("🆕 New 6", callback_data="game_new6")],
+            [InlineKeyboardButton("🏆 Group Top", callback_data="game_gtop"), InlineKeyboardButton("👤 My Stats", callback_data="game_mystats")],
+            [InlineKeyboardButton("⚔️ Chatfight", callback_data="game_chatfight"), InlineKeyboardButton("🌐 Global Top", callback_data="game_top")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="help_main")]
+        ])
+        txt=(
+            "🎮 <b>Game Center</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "Any user can start a new word game here.\n"
+            "• <b>New 4/5/6</b> — start 4/5/6-letter game in this chat\n"
+            "• <b>Group Top</b> — this group's leaderboard\n"
+            "• <b>My Stats</b> — your global + top groups (e.g., dhanush in 3 groups)\n"
+            "• <b>Chatfight</b> — most active by messages\n"
+            "• <b>Global Top</b> — all groups ranking"
+        )
+        try: await q.edit_message_text(txt, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html(txt, reply_markup=kb)
+
+    elif data in ("game_new4","game_new5","game_new6"):
+        length=int(data[-1])
+        cid=await get_cid()
+        if not cid:
+            await q.answer("Use in group or connect first via /connect", show_alert=True); return
+        # Start game — reuse logic from cmd_newgame (any user allowed)
+        existing=await db.get_game(cid)
+        if existing:
+            w,l,s,a,gj,bid=existing
+            try: sm=await context.bot.get_chat_member(cid,s); sname=sm.user.full_name
+            except: sname=str(s)
+            await q.answer(f"Game already in progress {l}L by {sname}", show_alert=True)
+            return
+        pool=WORD_BANK.get(length, WORD_BANK[5]); word=random.choice(pool)
+        await db.start_game(cid, word, q.from_user.id if q.from_user else 0)
+        board=Emojify.stack_emojify(word, [], length)
+        # Send to group chat, not callback message
+        try:
+            await context.bot.send_message(cid, f"🎲 <b>Word Jumble Started!</b> — {length} letters\nStarter: {esc(q.from_user.full_name if q.from_user else 'Player')}\nSend a {length}-letter word to guess. 🎯=perfect 🔀=misplaced 🚫=absent\n\n{board}", parse_mode=ParseMode.HTML)
+            await q.answer("Game started!", show_alert=False)
+            await log_to_support(context, f"NEW GAME {length}L via Button by {q.from_user.id if q.from_user else 0}", cid, q.from_user.id if q.from_user else 0, detail=word)
+        except Exception as e:
+            await q.answer(f"Failed: {e}", show_alert=True)
+
+    elif data=="game_gtop":
+        cid=await get_cid()
+        if not cid: await q.answer("No chat", show_alert=True); return
+        rows=await db.get_group_top(cid, 15)
+        if not rows:
+            await q.answer("No games in this group yet. Start with New 5!", show_alert=True); return
+        try: chat_title=esc((await context.bot.get_chat(cid)).title or str(cid))
+        except: chat_title=str(cid)
+        lines=[f"🏆 <b>Group Top — {chat_title}</b> (this group only)"]
+        for i,(uid,uname,wins,played) in enumerate(rows,1):
+            lines.append(f"{i}. {esc(uname or str(uid))} — {wins} wins / {played} played")
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Game", callback_data="game_menu")]])
+        try: await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html("\n".join(lines), reply_markup=kb)
+
+    elif data=="game_top":
+        rows=await db.top_players(10)
+        if not rows:
+            await q.answer("No wins yet. Start a game!", show_alert=True); return
+        lines=["🏆 <b>Global Top Players — All Groups</b>"]+[f"{i}. {esc(uname or str(uid))} — {wins} win{'s' if wins!=1 else ''}" for i,(uid,uname,wins) in enumerate(rows,1)]
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Game", callback_data="game_menu")]])
+        try: await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html("\n".join(lines), reply_markup=kb)
+
+    elif data=="game_mystats":
+        uid=q.from_user.id if q.from_user else 0
+        name=q.from_user.full_name if q.from_user else str(uid)
+        grow=await db._exec("SELECT username, wins, games_played FROM leaderboard WHERE user_id=?",(uid,),fetch="one")
+        if not grow:
+            await q.answer("No game data yet. Play /new!", show_alert=True); return
+        username, wins, played = grow[0], grow[1], grow[2]
+        groups=await db.get_user_top_groups(uid, 10)
+        lines=[f"📊 <b>Game Stats — {esc(name)}</b> {mention_html(uid,name)}", f"🌐 <b>Global:</b> {wins} wins / {played} games"]
+        if groups:
+            lines.append(f"\n🏘 <b>Top Groups for {esc(name)} (per-group ranking):</b>")
+            for idx,(chat_id, gwins, gplayed) in enumerate(groups,1):
+                try: ct=await context.bot.get_chat(chat_id); ct_title=esc(ct.title or str(chat_id))
+                except: ct_title=str(chat_id)
+                lines.append(f"{idx}. {ct_title} — <code>{chat_id}</code> → {gwins} wins / {gplayed} played")
+            lines.append(f"\n<i>Use Chatfight to see activity ranking.</i>")
+        hist=await db._exec("SELECT chat_id, word, won, attempts, timestamp FROM game_history WHERE user_id=? ORDER BY timestamp DESC LIMIT 5",(uid,),fetch="all")
+        if hist:
+            lines.append("\n📜 <b>Recent:</b>")
+            for chat_id, word, won, atts, ts in hist:
+                lines.append(f"• {esc(word)} — {'Won' if won else 'Lost'} in {atts}")
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Game", callback_data="game_menu")]])
+        try: await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html("\n".join(lines), reply_markup=kb)
+
+    elif data=="game_chatfight":
+        cid=await get_cid()
+        if not cid: await q.answer("No chat", show_alert=True); return
+        rows=await db.get_chatfight_top(cid, 15)
+        if not rows: await q.answer("No activity yet — chat to rank!", show_alert=True); return
+        try: chat_title=esc((await context.bot.get_chat(cid)).title or str(cid))
+        except: chat_title=str(cid)
+        lines=[f"⚔️ <b>Chatfight — Most Active in {chat_title}</b>\n<i>Ranked by messages</i>"]
+        for i,(uid, uname, fname, cnt) in enumerate(rows,1):
+            medal="🥇" if i==1 else "🥈" if i==2 else "🥉" if i==3 else f"{i}."
+            lines.append(f"{medal} {esc(fname or uname or str(uid))} — {cnt} msgs {mention_html(uid, fname or uname or str(uid))}")
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back to Game", callback_data="game_menu")]])
+        try: await q.edit_message_text("\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html("\n".join(lines), reply_markup=kb)
 
 async def cmd_id(update,context):
     msg=update.effective_message; user=update.effective_user
@@ -2065,6 +2349,7 @@ def build_app():
     app.add_handler(CommandHandler(["logs","modlogs","viewlogs"], cmd_modlogs), group=G_MAIN)
     app.add_handler(CommandHandler(["banlogs","bans"], cmd_banlogs), group=G_MAIN)
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help_"), group=G_MAIN)
+    app.add_handler(CallbackQueryHandler(cb_game, pattern=r"^game_"), group=G_MAIN)
     app.add_handler(CommandHandler("cleanwelcome", cmd_cleanwelcome), group=G_MAIN)
     app.add_handler(CommandHandler("cleanservice", cmd_cleanservice), group=G_MAIN)
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome), group=G_MAIN)
@@ -2085,6 +2370,9 @@ def build_app():
     app.add_handler(CommandHandler(["endgame","stopgame"], cmd_endgame), group=G_MAIN)
     app.add_handler(CommandHandler(["game","gamestatus","status"], cmd_gamestatus), group=G_MAIN)
     app.add_handler(CommandHandler(["top","leaderboard","lb"], cmd_top), group=G_MAIN)
+    app.add_handler(CommandHandler(["gtop","grouptop","group_top","rank"], cmd_group_top), group=G_MAIN)
+    app.add_handler(CommandHandler(["mystats","myrank","mystat","mygroup","mygroups","profile"], cmd_mystats), group=G_MAIN)
+    app.add_handler(CommandHandler(["chatfight","activity","topchat","chatrank","leaderchat"], cmd_chatfight), group=G_MAIN)
     app.add_handler(CommandHandler("connect", cmd_connect), group=G_MAIN)
     app.add_handler(CommandHandler(["connections"], cmd_connections), group=G_MAIN)
     app.add_handler(CommandHandler(["disconnect","discon"], cmd_disconnect), group=G_MAIN)
