@@ -461,6 +461,15 @@ class Database:
     async def remove_gban(self, uid): await self._exec("DELETE FROM global_bans WHERE user_id=?",(uid,))
     async def is_gbanned(self, uid): row=await self._exec("SELECT 1 FROM global_bans WHERE user_id=?",(uid,),fetch="one"); return bool(row)
     async def list_gbans(self): rows=await self._exec("SELECT user_id, reason FROM global_bans ORDER BY user_id",fetch="all"); return rows or []
+    # ── Mod logs (per-group, group owner sees only their group) ──
+    async def get_mod_logs(self, chat_id, limit=20): rows=await self._exec("SELECT chat_id, actor_id, action, target_id, detail, timestamp FROM support_logs WHERE chat_id=? ORDER BY timestamp DESC LIMIT ?",(chat_id, limit),fetch="all"); return rows or []
+    async def get_all_mod_logs(self, limit=50): rows=await self._exec("SELECT chat_id, actor_id, action, target_id, detail, timestamp FROM support_logs ORDER BY timestamp DESC LIMIT ?",(limit,),fetch="all"); return rows or []
+    async def get_ban_logs(self, chat_id=None, limit=50):
+        if chat_id:
+            rows=await self._exec("SELECT chat_id, actor_id, action, target_id, detail, timestamp FROM support_logs WHERE chat_id=? AND (action LIKE 'BAN%' OR action LIKE 'MUTE%' OR action LIKE 'KICK%' OR action LIKE 'WARN%') ORDER BY timestamp DESC LIMIT ?",(chat_id,limit),fetch="all")
+        else:
+            rows=await self._exec("SELECT chat_id, actor_id, action, target_id, detail, timestamp FROM support_logs WHERE action LIKE 'BAN%' OR action LIKE 'MUTE%' OR action LIKE 'KICK%' OR action LIKE 'WARN%' ORDER BY timestamp DESC LIMIT ?",(limit,),fetch="all")
+        return rows or []
     async def check_global(self, text):
         words=await self.list_global_words(); low=text.lower()
         for w in words:
@@ -771,15 +780,21 @@ async def cmd_mute(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Usage: /mute <@username|ID> [time]"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /mute <@username|ID> [reason] [time like 1h] — supports reply/@username/ID"); return
     uid,name=tgt
     if await is_admin(update,context,uid): await update.effective_message.reply_text("Can't mute admin"); return
+    # Parse time + reason: last arg may be duration, preceding are reason
+    reason=" ".join(context.args[1:]) if len(context.args)>1 else "Muted"
     until=None; cmd=update.effective_message.text.split()[0].lstrip("/").lower().split("@")[0]
-    if context.args and parse_duration(context.args[-1]): until=datetime.datetime.now(datetime.timezone.utc)+parse_duration(context.args[-1])
+    if context.args and parse_duration(context.args[-1]):
+        until=datetime.datetime.now(datetime.timezone.utc)+parse_duration(context.args[-1])
+        # if last is time, reason is middle args
+        reason=" ".join(context.args[1:-1]) if len(context.args)>2 else reason if until else reason
+        if not reason or parse_duration(reason): reason="Muted"
     try:
         await context.bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=False),until_date=until)
-        await update.effective_message.reply_html(f"🔇 Muted {mention_html(uid,name)}")
-        await log_to_support(context,f"MUTE {uid}",cid,update.effective_user.id,uid)
+        await update.effective_message.reply_html(f"🔇 Muted {mention_html(uid,name)} <i>{esc(reason)}</i>")
+        await log_to_support(context,f"MUTE {uid} in {cid} reason:{reason}",cid,update.effective_user.id,uid,reason)
         if cmd in ("smute","tmute"):
             try: await update.effective_message.delete()
             except: pass
@@ -803,10 +818,11 @@ async def cmd_kick(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
-    if not tgt: await update.effective_message.reply_text("Usage: /kick <@username|ID>"); return
+    if not tgt: await update.effective_message.reply_text("Usage: Reply or /kick <@username|ID> [reason] — supports reply/@username/ID"); return
     uid,name=tgt
     if await is_admin(update,context,uid): await update.effective_message.reply_text("Can't kick admin"); return
-    try: await context.bot.ban_chat_member(cid,uid); await context.bot.unban_chat_member(cid,uid); await update.effective_message.reply_html(f"👢 Kicked {mention_html(uid,name)}"); await log_to_support(context,f"KICK {uid}",cid,update.effective_user.id,uid)
+    reason=" ".join(context.args[1:]) if len(context.args)>1 else "Kicked"
+    try: await context.bot.ban_chat_member(cid,uid); await context.bot.unban_chat_member(cid,uid); await update.effective_message.reply_html(f"👢 Kicked {mention_html(uid,name)} <i>{esc(reason)}</i>"); await log_to_support(context,f"KICK {uid} in {cid} reason:{reason}",cid,update.effective_user.id,uid,reason)
     except Exception as e: await update.effective_message.reply_text(f"Kick failed: {e}")
 
 async def cmd_promote(update,context):
@@ -1007,21 +1023,62 @@ async def cmd_untrust(update,context):
     if not tgt: await update.effective_message.reply_text("Reply or /untrust <@username|ID>"); return
     uid,name=tgt; await db.untrust(cid,uid); await update.effective_message.reply_html(f"❌ Untrusted {mention_html(uid,name)}")
 
-# ── Vault ──
-@owner_required
+# ── Vault (Banned Words) — Group Owner per-group, Bot Owner global ──
 async def cmd_addbanword(update,context):
-    if not context.args: await update.effective_message.reply_text("Usage: /addbword <word>"); return
-    phrase=" ".join(context.args); await db.add_global_word(phrase,update.effective_user.id); await update.effective_message.reply_html(f"🔒 Added <code>{esc(phrase.lower())}</code>"); await log_to_support(context,f"ADD VAULT {phrase}",None,update.effective_user.id)
-@owner_required
+    if not context.args: await update.effective_message.reply_text("Usage: /addbword <word>\nGroup Owner adds per-group, Bot Owner adds global"); return
+    phrase=" ".join(context.args).lower().strip()
+    uid=update.effective_user.id if update.effective_user else 0
+    # Bot Owner → global vault (all groups)
+    if await is_owner(uid):
+        await db.add_global_word(phrase,uid)
+        await update.effective_message.reply_html(f"🌐 Global vault: Added <code>{esc(phrase)}</code> — affects all groups")
+        await log_to_support(context,f"ADD VAULT GLOBAL {phrase}",None,uid)
+        return
+    # Group Owner → per-group blocklist (only this group)
+    if await is_group_owner(update,context):
+        cid=await effective_chat_id(update,context)
+        if not cid: return
+        await db.add_blocklist(cid, phrase)
+        await update.effective_message.reply_html(f"🔒 Added to <b>Group</b> blocklist: <code>{esc(phrase)}</code> — only this group")
+        await log_to_support(context,f"ADD BLOCKLIST {phrase}",cid,uid)
+        return
+    await update.effective_message.reply_text("🚫 Only Group Owner or Bot Owner can add banned words.\nGroup Owner manages per-group list; Bot Owner manages global vault.")
+
 async def cmd_rmbanword(update,context):
     if not context.args: await update.effective_message.reply_text("Usage: /rmbword <word>"); return
-    phrase=" ".join(context.args); cnt=await db.remove_global_word(phrase); await update.effective_message.reply_text("Removed" if cnt else "Not found")
-@owner_required
+    phrase=" ".join(context.args).lower().strip()
+    uid=update.effective_user.id if update.effective_user else 0
+    if await is_owner(uid):
+        cnt=await db.remove_global_word(phrase)
+        await update.effective_message.reply_text(f"🌐 Global vault: {'Removed' if cnt else 'Not found'}")
+        return
+    if await is_group_owner(update,context):
+        cid=await effective_chat_id(update,context)
+        if not cid: return
+        cnt=await db.rm_blocklist(cid, phrase)
+        await update.effective_message.reply_text(f"🔒 Group blocklist: {'Removed' if cnt else 'Not found'} — only this group")
+        return
+    await update.effective_message.reply_text("🚫 Only Group Owner or Bot Owner can remove banned words.")
+
 async def cmd_listbanwords(update,context):
-    words=await db.list_global_words()
-    if not words: await update.effective_message.reply_text("Vault empty"); return
-    txt="\n".join(f"• <code>{esc(w)}</code>" for w in words[:100])
-    await update.effective_message.reply_html(f"🌐 <b>Vault ({len(words)}):</b>\n{txt}")
+    uid=update.effective_user.id if update.effective_user else 0
+    # Bot Owner sees global vault
+    if await is_owner(uid):
+        words=await db.list_global_words()
+        if not words: await update.effective_message.reply_text("🌐 Global vault empty\nGroup owners manage per-group lists via /addbword in their group"); return
+        txt="\n".join(f"• <code>{esc(w)}</code>" for w in words[:100])
+        await update.effective_message.reply_html(f"🌐 <b>Global Vault ({len(words)}):</b>\n{txt}\n\n<i>Group Owner per-group lists are separate — run in group to see.</i>")
+        return
+    # Group Owner sees per-group list
+    if await is_group_owner(update,context):
+        cid=await effective_chat_id(update,context)
+        if not cid: return
+        words=await db.list_blocklist(cid)
+        if not words: await update.effective_message.reply_text("🔒 This group's blocklist empty. Add with /addbword <word>"); return
+        txt="\n".join(f"• <code>{esc(w)}</code>" for w in words[:100])
+        await update.effective_message.reply_html(f"🔒 <b>Group Blocklist ({len(words)}) for this group:</b>\n{txt}\n\n<i>Only this group — other groups unaffected. Bot Owner vault is global.</i>")
+        return
+    await update.effective_message.reply_text("🔒 Only Group Owner can view this group's blocklist.\nBot Owner can view global vault in private.")
 
 # ── Federation Ban (Group Owner) ──
 @group_owner_required
@@ -1186,6 +1243,81 @@ async def cmd_setlog(update,context):
     val=context.args[0]
     if not val.lstrip("-").isdigit(): await update.effective_message.reply_text("Invalid ID"); return
     await db.set_config("SUPPORT_CHAT_ID",val); await update.effective_message.reply_html(f"✅ Log channel set to <code>{esc(val)}</code>")
+
+# ── Mod Logs (Group Owner sees own group, Bot Owner sees all) ──
+async def cmd_modlogs(update,context):
+    cid=await effective_chat_id(update,context)
+    # Determine viewer
+    uid=update.effective_user.id if update.effective_user else 0
+    is_bot_owner=await is_owner(uid)
+    # Bot Owner can view all or specific chat
+    if is_bot_owner:
+        # If in private and args given, show that chat's logs
+        if context.args and context.args[0].lstrip("-").isdigit():
+            target_cid=int(context.args[0])
+            rows=await db.get_mod_logs(target_cid, 30)
+            if not rows: await update.effective_message.reply_text(f"No logs for <code>{target_cid}</code>"); return
+            lines=[f"📋 <b>Logs for <code>{target_cid}</code> (Bot Owner view):</b>"]
+        elif context.args and context.args[0].lower()=="all":
+            rows=await db.get_all_mod_logs(50)
+            if not rows: await update.effective_message.reply_text("No logs yet"); return
+            lines=[f"📋 <b>All Groups Logs (Bot Owner — {len(rows)}):</b>"]
+        else:
+            # If in group, show that group's logs even for bot owner
+            if cid:
+                rows=await db.get_mod_logs(cid, 30)
+                if not rows: await update.effective_message.reply_text("No logs for this group"); return
+                lines=[f"📋 <b>Logs for <code>{cid}</code>:</b>"]
+            else:
+                rows=await db.get_all_mod_logs(50)
+                if not rows: await update.effective_message.reply_text("No logs yet — use /logs <chat_id> or /logs all"); return
+                lines=[f"📋 <b>All Logs (Bot Owner):</b>"]
+    else:
+        # Group Owner / Admin — only own group's logs
+        if not cid: await update.effective_message.reply_text("Run /logs in the group or connect via /connect"); return
+        # Check group owner permission
+        if not await is_group_owner(update,context) and not await is_admin(update,context):
+            await update.effective_message.reply_text("🚫 Only Group Owner or admins can view logs for this group."); return
+        rows=await db.get_mod_logs(cid, 30)
+        if not rows: await update.effective_message.reply_text("No moderation logs for this group yet.\nBans/mutes/warns will appear here with reasons."); return
+        lines=[f"📋 <b>Mod Logs for this group (<code>{cid}</code>):</b>\n<i>Only this group's data — other groups hidden. Bot Owner can see all.</i>"]
+
+    for r in rows:
+        rcid, actor, act, target, detail, ts = r
+        # Format: time | actor -> target : action (reason)
+        time = str(ts or "")[:16]
+        actor_txt = f"<code>{actor}</code>" if actor else "?"
+        target_txt = f"<code>{target}</code>" if target else "-"
+        detail_txt = esc((detail or "")[:60])
+        # Show chat_id only for bot owner all view
+        chat_part = f" [{rcid}]" if is_bot_owner and len(lines)<30 and rcid != cid else ""
+        lines.append(f"• {time}{chat_part} {esc(act or '')} — by {actor_txt} → {target_txt} <i>{detail_txt}</i>")
+        if len("\n".join(lines)) > 3500:
+            lines.append(f"... and {len(rows)-len(lines)+1} more")
+            break
+    await update.effective_message.reply_html("\n".join(lines))
+
+async def cmd_banlogs(update,context):
+    cid=await effective_chat_id(update,context)
+    uid=update.effective_user.id if update.effective_user else 0
+    is_bot_owner=await is_owner(uid)
+    if is_bot_owner and context.args and context.args[0].lstrip("-").isdigit():
+        target_cid=int(context.args[0]); rows=await db.get_ban_logs(target_cid, 30)
+    elif is_bot_owner and context.args and context.args[0].lower()=="all":
+        rows=await db.get_ban_logs(None, 50)
+    else:
+        if not cid: await update.effective_message.reply_text("Run in group or /connect"); return
+        if not await is_group_owner(update,context) and not await is_admin(update,context):
+            await update.effective_message.reply_text("🚫 Only Group Owner/admins can view ban logs."); return
+        rows=await db.get_ban_logs(cid, 30)
+    if not rows: await update.effective_message.reply_text("No ban/mute/kick/warn logs yet — reasons will appear here."); return
+    title = "🌐 All Ban Logs (Bot Owner)" if (is_bot_owner and not cid) else f"🔨 Ban Logs for <code>{cid or 'all'}</code>"
+    lines=[f"{title} — <i>reasons noted</i>"]
+    for r in rows:
+        rcid, actor, act, target, detail, ts = r
+        lines.append(f"• <code>{ts or ''}</code> {esc(act)} — <code>{target or '-'}</code> by <code>{actor or '?'}</code> <i>{esc(detail[:50] if detail else '')}</i>")
+        if len("\n".join(lines))>3500: break
+    await update.effective_message.reply_html("\n".join(lines))
 
 # ── FILTERS FIXED (per-chat media) ──
 @perm_required("can_change_info")
@@ -1763,7 +1895,6 @@ async def cmd_start(update,context):
     txt = (
         "✨ <b>Miss Sona — Your ultimate group Guardian</b> ✨\n\n"
         "Used open source ai + industrial modules\n\n"
-        "Made with emojify love by the secret squad"
     )
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Help", callback_data="help_main")]])
     await update.effective_message.reply_html(branded_start(txt), reply_markup=kb)
@@ -1777,40 +1908,40 @@ HELP_MEMBER_TEXT = (
     "━━━━━━━━━━━━━━━━━━━━\n"
     "• <code>/rules</code> — view group rules\n"
     "• <code>/adminlist</code> — list admins\n"
-    "• <code>/id</code> <code>/chatid</code> <code>/myid</code> — get IDs\n"
-    "• <code>/info</code> — user info (reply/@)\n"
-    "• <code>/top</code> — game leaderboard\n"
-    "• <code>/game</code> — word game status\n"
+    "• <code>/id</code> — get own/group ID\n"
+    "• <code>/top</code> — leaderboard\n"
     "• <code>/support</code> — support link\n"
-    "• <code>/help</code> — this menu\n"
-    "\n<i>Tip: Try <code>/new</code> to start a word game!</i>"
+    "\n<i>All other commands require admin/owner powers.</i>"
 )
 
 HELP_ADMIN_TEXT = (
     "🛡️ <b>Admin Commands</b> — requires specific admin power\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
+    "Use via <b>reply</b>, <b>@username</b> or <b>numeric ID</b> with optional reason:\n"
+    "<code>/ban @user spam</code> | <code>/ban 123456789 reason</code> | reply <code>/ban reason</code>\n"
     "If you lack the power, bot replies:\n"
     "<i>🚫 You don't have the power... Please contact the group owner.</i>\n\n"
-    "• <b>Restrict</b> (<code>can_restrict_members</code>) → <code>/ban</code> <code>/tban</code> <code>/unban</code> <code>/mute</code> <code>/tmute</code> <code>/unmute</code> <code>/kick</code> <code>/warn</code>\n"
-    "• <b>Delete</b> (<code>can_delete_messages</code>) → <code>/lock</code> <code>/unlock</code> <code>/locks</code> <code>/allowlist</code> <code>/blocklist</code> <code>/setflood</code> <code>/cleanwelcome</code>\n"
+    "• <b>Restrict</b> (<code>can_restrict_members</code>) → <code>/ban</code> <code>/tban</code> <code>/dban</code> <code>/sban</code> <code>/unban</code> <code>/mute</code> <code>/tmute</code> <code>/dmute</code> <code>/smute</code> <code>/unmute</code> <code>/kick</code> <code>/warn</code> <code>/rmwarn</code>\n"
+    "• <b>Delete</b> (<code>can_delete_messages</code>) → <code>/lock</code> <code>/unlock</code> <code>/locks</code> <code>/allowlist</code> <code>/blocklist</code> <code>/setflood</code>\n"
     "• <b>Promote</b> (<code>can_promote_members</code>) → <code>/promote</code> <code>/demote</code>\n"
-    "• <b>Change Info</b> (<code>can_change_info</code>) → <code>/setwelcome</code> <code>/setrules</code> <code>/filter</code> <code>/note</code> <code>/setgoodbye</code>\n"
-    "• <b>Pin</b> (<code>can_pin_messages</code>) → <code>/pin</code> (if enabled)\n"
-    "• <b>Other:</b> <code>/all</code> <code>/admins</code> <code>/shadowreply</code> <code>/endgame</code>\n"
-    "\n<i>Owner gives powers via Group Info → Administrators → select admin → toggle rights.</i>"
+    "• <b>Change Info</b> (<code>can_change_info</code>) → <code>/setwelcome</code> <code>/setrules</code> <code>/filter</code> <code>/note</code> <code>/setgoodbye</code> <code>/welcome</code>\n"
+    "• <b>Info</b> → <code>/warns</code> <code>/adminlist</code> <code>/logs</code> (own group only)\n"
+    "\n<i>All reasons are saved — Group Owner sees their group's logs only, Bot Owner sees all.</i>\n"
+    "<i>Owner gives powers via Group → Info → Administrators → edit rights.</i>"
 )
 
 HELP_OWNER_TEXT = (
     "👑 <b>Group Owner Commands</b> — group creator only\n"
     "━━━━━━━━━━━━━━━━━━━━\n"
-    "• <code>/fban</code> <code>&lt;@user|ID&gt;</code> [reason] — federation global ban\n"
-    "• <code>/unfban</code> — remove global ban\n"
-    "• <code>/listfbans</code> — list federation bans\n"
-    "• <code>/addbword</code> / <code>/rmbword</code> / <code>/listbwords</code> — owner vault\n"
+    "• <code>/addbword &lt;word&gt;</code> / <code>/rmbword</code> / <code>/listbwords</code> — banned words (per-group, only this group)\n"
+    "• <code>/fban</code> <code>&lt;@user|ID&gt;</code> [reason] — federation global ban (reply/@/ID)\n"
+    "• <code>/unfban</code> / <code>/listfbans</code>\n"
+    "• <code>/logs</code> / <code>/modlogs</code> — view this group's mod logs with reasons (isolated per-group)\n"
+    "• <code>/banlogs</code> — ban/mute/kick/warn history with reasons\n"
     "• <code>/setlog &lt;chat_id&gt;</code> — set log channel\n"
     "• <code>/export</code> / <code>/import</code> — backup\n"
-    "• <code>/disable</code> / <code>/enable</code> — disable commands\n"
-    "\n<i>Bot Owner (OWNER_ID) also bypasses all checks.</i>"
+    "• <code>/disable</code> / <code>/enable</code>\n"
+    "\n<i>Bot Owner sees all groups' logs; Group Owner sees only their group's.</i>"
 )
 
 async def cb_help(update,context):
@@ -1931,6 +2062,8 @@ def build_app():
     app.add_handler(CommandHandler(["fban","gban"], cmd_fban), group=G_MAIN)
     app.add_handler(CommandHandler(["unfban","ungban"], cmd_unfban), group=G_MAIN)
     app.add_handler(CommandHandler(["listfbans","fbans"], cmd_listfbans), group=G_MAIN)
+    app.add_handler(CommandHandler(["logs","modlogs","viewlogs"], cmd_modlogs), group=G_MAIN)
+    app.add_handler(CommandHandler(["banlogs","bans"], cmd_banlogs), group=G_MAIN)
     app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help_"), group=G_MAIN)
     app.add_handler(CommandHandler("cleanwelcome", cmd_cleanwelcome), group=G_MAIN)
     app.add_handler(CommandHandler("cleanservice", cmd_cleanservice), group=G_MAIN)
