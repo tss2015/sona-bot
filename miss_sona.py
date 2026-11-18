@@ -382,6 +382,7 @@ class Database:
         cur.execute("""CREATE TABLE IF NOT EXISTS bot_config(key TEXT PRIMARY KEY, value TEXT)""")
         cur.execute("""CREATE TABLE IF NOT EXISTS warns_settings(chat_id INTEGER PRIMARY KEY, limit_num INTEGER DEFAULT 3, mode TEXT DEFAULT 'ban')""")
         cur.execute("""CREATE TABLE IF NOT EXISTS support_logs(log_id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER, actor_id INTEGER, action TEXT, target_id INTEGER, detail TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS global_bans(user_id INTEGER PRIMARY KEY, reason TEXT, banned_by INTEGER, banned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)""")
         for col, typ in [("guesses_json","TEXT DEFAULT '[]'"),("board_msg_id","INTEGER")]:
             try: cur.execute(f"ALTER TABLE games ADD COLUMN {col} {typ}")
             except: pass
@@ -455,6 +456,11 @@ class Database:
     async def add_global_word(self, word, by): await self._exec("INSERT OR IGNORE INTO global_banned_words(word,added_by) VALUES(?,?)",(word.lower().strip(),by))
     async def remove_global_word(self, word): return await self._exec("DELETE FROM global_banned_words WHERE word=?",(word.lower().strip(),))
     async def list_global_words(self): rows=await self._exec("SELECT word FROM global_banned_words ORDER BY word",fetch="all"); return [r[0] for r in (rows or [])]
+    # ── Global bans (Federation) ──
+    async def add_gban(self, uid, reason, by): await self._exec("INSERT OR REPLACE INTO global_bans(user_id,reason,banned_by) VALUES(?,?,?)",(uid,reason,by))
+    async def remove_gban(self, uid): await self._exec("DELETE FROM global_bans WHERE user_id=?",(uid,))
+    async def is_gbanned(self, uid): row=await self._exec("SELECT 1 FROM global_bans WHERE user_id=?",(uid,),fetch="one"); return bool(row)
+    async def list_gbans(self): rows=await self._exec("SELECT user_id, reason FROM global_bans ORDER BY user_id",fetch="all"); return rows or []
     async def check_global(self, text):
         words=await self.list_global_words(); low=text.lower()
         for w in words:
@@ -636,6 +642,78 @@ def owner_required(func):
             return
         return await func(update,context,*a,**k)
     return w
+
+# ── Permission helpers (Telegram admin rights) ──
+PERM_HUMAN = {
+    "can_restrict_members": "ban/restrict",
+    "can_delete_messages": "delete messages",
+    "can_pin_messages": "pin messages",
+    "can_promote_members": "promote members",
+    "can_change_info": "change group info",
+    "can_invite_users": "invite users",
+    "can_manage_chat": "manage chat",
+}
+
+async def is_group_owner(update, context):
+    cid=await effective_chat_id(update,context)
+    if not cid or not update.effective_user:
+        return False
+    if await is_owner(update.effective_user.id):
+        return True
+    try:
+        m=await context.bot.get_chat_member(cid, update.effective_user.id)
+        return m.status == ChatMemberStatus.OWNER
+    except:
+        return False
+
+async def has_perm(update, context, perm_attr: str) -> bool:
+    if not update.effective_user:
+        return False
+    if await is_owner(update.effective_user.id):
+        return True
+    cid=await effective_chat_id(update,context)
+    if not cid:
+        return False
+    try:
+        m=await context.bot.get_chat_member(cid, update.effective_user.id)
+        if m.status == ChatMemberStatus.OWNER:
+            return True
+        # m may be ChatMemberAdministrator
+        val = getattr(m, perm_attr, None)
+        # Some older PTB versions use can_manage_chat as super-perm
+        if val is True:
+            return True
+        # Fallback: if admin but perm not granted, deny
+        return False
+    except Exception as e:
+        log.debug("has_perm check failed %s", e)
+        return False
+
+def perm_required(perm_attr: str):
+    """Check specific Telegram admin right, with friendly owner-contact message."""
+    human = PERM_HUMAN.get(perm_attr, perm_attr)
+    def deco(func):
+        async def w(update, context, *a, **k):
+            if not await is_admin(update, context):
+                if update.effective_message:
+                    await update.effective_message.reply_text("🚫 Only admins can use this command.")
+                return
+            if not await has_perm(update, context, perm_attr):
+                if update.effective_message:
+                    await update.effective_message.reply_text(f"🚫 You don't have the power to do that ({human}). Please contact the group owner.")
+                return
+            return await func(update, context, *a, **k)
+        return w
+    return deco
+
+def group_owner_required(func):
+    async def w(update, context, *a, **k):
+        if not await is_group_owner(update, context):
+            if update.effective_message:
+                await update.effective_message.reply_text("🔒 Group Owner only — please contact the group owner.")
+            return
+        return await func(update, context, *a, **k)
+    return w
 async def check_bypass(update,context):
     user=update.effective_user; chat=update.effective_chat
     if not user or not chat: return True
@@ -650,7 +728,7 @@ async def check_bypass(update,context):
     return False
 
 # ── Moderation ──
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_ban(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -678,7 +756,7 @@ async def cmd_ban(update,context):
             except: pass
     except Exception as e: await update.effective_message.reply_text(f"Ban failed: {e}")
 
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_unban(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -688,7 +766,7 @@ async def cmd_unban(update,context):
     try: await context.bot.unban_chat_member(cid,uid); await update.effective_message.reply_html(f"✅ Unbanned {mention_html(uid,name)}"); await log_to_support(context,f"UNBAN {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Unban failed: {e}")
 
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_mute(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -710,7 +788,7 @@ async def cmd_mute(update,context):
             except: pass
     except Exception as e: await update.effective_message.reply_text(f"Mute failed: {e}")
 
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_unmute(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -720,7 +798,7 @@ async def cmd_unmute(update,context):
     try: await context.bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=True,can_send_media_messages=True,can_send_other_messages=True,can_add_web_page_previews=True)); await update.effective_message.reply_html(f"🔊 Unmuted {mention_html(uid,name)}"); await log_to_support(context,f"UNMUTE {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Unmute failed: {e}")
 
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_kick(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -733,6 +811,7 @@ async def cmd_kick(update,context):
 
 async def cmd_promote(update,context):
     if not await is_admin(update,context): await update.effective_message.reply_text("🚫 Only admins."); return
+    if not await has_perm(update,context,"can_promote_members"): await update.effective_message.reply_text(f"🚫 You don't have the power to do that ({PERM_HUMAN['can_promote_members']}). Please contact the group owner."); return
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
@@ -743,6 +822,7 @@ async def cmd_promote(update,context):
 
 async def cmd_demote(update,context):
     if not await is_admin(update,context): await update.effective_message.reply_text("🚫 Only admins."); return
+    if not await has_perm(update,context,"can_promote_members"): await update.effective_message.reply_text(f"🚫 You don't have the power to do that ({PERM_HUMAN['can_promote_members']}). Please contact the group owner."); return
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
@@ -751,7 +831,7 @@ async def cmd_demote(update,context):
     try: await context.bot.promote_chat_member(cid,uid,can_delete_messages=False,can_restrict_members=False,can_pin_messages=False); await update.effective_message.reply_html(f"⬇️ Demoted {mention_html(uid,name)}"); await log_to_support(context,f"DEMOTE {uid}",cid,update.effective_user.id,uid)
     except Exception as e: await update.effective_message.reply_text(f"Demote failed: {e}")
 
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_warn(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -782,21 +862,21 @@ async def cmd_warns(update,context):
     else: uid=update.effective_user.id; name=update.effective_user.full_name
     c=await db.get_warns(cid,uid); limit,_=await db.get_warns_settings(cid)
     await update.effective_message.reply_html(f"📋 {mention_html(uid,name)} has {c}/{limit} warns")
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_rmwarn(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
     if not tgt: await update.effective_message.reply_text("Reply or /rmwarn <@username|ID>"); return
     uid,name=tgt; newc=await db.rm_warn(cid,uid); await update.effective_message.reply_html(f"✅ Removed warn for {mention_html(uid,name)} → {newc}")
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_resetwarn(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
     if not tgt: await update.effective_message.reply_text("Usage: /resetwarn <@username|ID>"); return
     uid,name=tgt; await db.reset_warns(cid,uid); await update.effective_message.reply_html(f"✅ Reset warns for {mention_html(uid,name)}")
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_resetallwarns(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -805,7 +885,7 @@ async def cmd_warnings(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     limit,mode=await db.get_warns_settings(cid); await update.effective_message.reply_html(f"⚙️ Warn limit: <b>{limit}</b>\nWarn mode: <b>{esc(mode)}</b>")
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_warnmode(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -813,7 +893,7 @@ async def cmd_warnmode(update,context):
     mode=context.args[0].lower()
     if mode not in ("ban","kick","mute","tban","tmute"): await update.effective_message.reply_text("Valid: ban/kick/mute/tban/tmute"); return
     await db.set_warn_mode(cid,mode); await update.effective_message.reply_text(f"Warn mode set to {mode}")
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_warnlimit(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -835,6 +915,7 @@ async def cmd_anonadmin(update,context):
 
 async def cmd_approve(update,context):
     if not await is_admin(update,context): await update.effective_message.reply_text("🚫 Only admins."); return
+    if not await has_perm(update,context,"can_restrict_members"): await update.effective_message.reply_text(f"🚫 You don't have the power to do that ({PERM_HUMAN['can_restrict_members']}). Please contact the group owner."); return
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
@@ -842,6 +923,7 @@ async def cmd_approve(update,context):
     uid,name=tgt; await db.trust(cid,uid,update.effective_user.id); await update.effective_message.reply_html(f"✅ Approved {mention_html(uid,name)}"); await log_to_support(context,f"APPROVE {uid}",cid,update.effective_user.id,uid)
 async def cmd_unapprove(update,context):
     if not await is_admin(update,context): await update.effective_message.reply_text("🚫 Only admins."); return
+    if not await has_perm(update,context,"can_restrict_members"): await update.effective_message.reply_text(f"🚫 You don't have the power to do that ({PERM_HUMAN['can_restrict_members']}). Please contact the group owner."); return
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
@@ -858,25 +940,25 @@ async def cmd_rules(update,context):
         try: await context.bot.send_message(update.effective_user.id,f"📜 <b>Rules for {esc(update.effective_chat.title or str(cid))}</b>:\n\n{c}",parse_mode=ParseMode.HTML); await update.effective_message.reply_text("Rules sent in private"); return
         except: pass
     await update.effective_message.reply_html((c))
-@admin_required
+@perm_required("can_change_info")
 async def cmd_setrules(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     txt=" ".join(context.args) if context.args else (update.effective_message.reply_to_message.text if update.effective_message.reply_to_message and update.effective_message.reply_to_message.text else "")
     if not txt: await update.effective_message.reply_text("Usage: /setrules <text>"); return
     await db.set_rules(cid,txt); await update.effective_message.reply_text("✅ Rules updated"); await log_to_support(context,"SET RULES",cid,update.effective_user.id)
-@admin_required
+@perm_required("can_change_info")
 async def cmd_privaterules(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: await update.effective_message.reply_text(f"Private: {await db.get_privaterules(cid)}"); return
     val=context.args[0].lower() in ("yes","on","true"); await db.set_privaterules(cid,val); await update.effective_message.reply_text(f"Private rules {'on' if val else 'off'}")
-@admin_required
+@perm_required("can_change_info")
 async def cmd_resetrules(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     await db.reset_rules(cid); await update.effective_message.reply_text("✅ Rules reset")
-@admin_required
+@perm_required("can_change_info")
 async def cmd_setnote(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -897,7 +979,7 @@ async def cmd_getnote(update,context):
     name=context.args[0].lstrip("#"); c=await db.get_note(cid,name)
     if not c: await update.effective_message.reply_text("Not found"); return
     await update.effective_message.reply_html((c))
-@admin_required
+@perm_required("can_change_info")
 async def cmd_delnote(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -910,14 +992,14 @@ async def hashtag_note_handler(update,context):
     if not m: return
     c=await db.get_note(update.effective_chat.id,m.group(1))
     if c: await update.effective_message.reply_html((c))
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_trust(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     tgt=await resolve_target(update,context)
     if not tgt: await update.effective_message.reply_text("Reply or /trust <@username|ID>"); return
     uid,name=tgt; await db.trust(cid,uid,update.effective_user.id); await update.effective_message.reply_html(f"✅ Trusted {mention_html(uid,name)}")
-@admin_required
+@perm_required("can_restrict_members")
 async def cmd_untrust(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -941,8 +1023,38 @@ async def cmd_listbanwords(update,context):
     txt="\n".join(f"• <code>{esc(w)}</code>" for w in words[:100])
     await update.effective_message.reply_html(f"🌐 <b>Vault ({len(words)}):</b>\n{txt}")
 
+# ── Federation Ban (Group Owner) ──
+@group_owner_required
+async def cmd_fban(update,context):
+    if not context.args and not (update.effective_message.reply_to_message and update.effective_message.reply_to_message.from_user):
+        await update.effective_message.reply_text("Usage: /fban <@username|ID> [reason] or reply"); return
+    tgt=await resolve_target(update,context)
+    if not tgt: await update.effective_message.reply_text("User not found. Let them chat once or use reply/ID."); return
+    uid, name=tgt
+    if await is_owner(uid): await update.effective_message.reply_text("Can't fban owner"); return
+    reason=" ".join(context.args[1:]) if len(context.args)>1 else "Federation ban"
+    await db.add_gban(uid, reason, update.effective_user.id)
+    await update.effective_message.reply_html(f"🌐 <b>F-Banned</b> {mention_html(uid,name)} — <i>{esc(reason)}</i>\nApplied to all groups with Miss Sona.")
+    await log_to_support(context,f"FBAN {uid} reason:{reason}",None,update.effective_user.id,uid,reason)
+
+@group_owner_required
+async def cmd_unfban(update,context):
+    tgt=await resolve_target(update,context)
+    if not tgt: await update.effective_message.reply_text("Usage: /unfban <@username|ID>"); return
+    uid,name=tgt
+    await db.remove_gban(uid)
+    await update.effective_message.reply_html(f"✅ <b>Un-FBanned</b> {mention_html(uid,name)}")
+    await log_to_support(context,f"UNFBAN {uid}",None,update.effective_user.id,uid)
+
+@group_owner_required
+async def cmd_listfbans(update,context):
+    rows=await db.list_gbans()
+    if not rows: await update.effective_message.reply_text("No federation bans."); return
+    txt="\n".join(f"• <code>{uid}</code> — {esc(reason or '')}" for uid,reason in rows[:100])
+    await update.effective_message.reply_html(f"🌐 <b>Federation Bans ({len(rows)}):</b>\n{txt}")
+
 # ── Locks ──
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_lock(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -950,7 +1062,7 @@ async def cmd_lock(update,context):
     for t in context.args:
         if t.lower() in LOCK_TYPES: await db.set_lock(cid,t.lower(),True)
     await update.effective_message.reply_text(f"🔒 Locked: {', '.join(context.args)}"); await log_to_support(context,f"LOCK {context.args}",cid,update.effective_user.id)
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_unlock(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -958,7 +1070,7 @@ async def cmd_unlock(update,context):
     for t in context.args:
         if t.lower() in LOCK_TYPES: await db.set_lock(cid,t.lower(),False)
     await update.effective_message.reply_text(f"🔓 Unlocked: {', '.join(context.args)}")
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_locks_panel(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -989,56 +1101,56 @@ async def cmd_lockwarns(update,context):
     if not cid: return
     if not context.args: s=await db.get_settings(cid); await update.effective_message.reply_text(f"lockwarns: {'on' if s['lockwarns'] else 'off'}"); return
     val=context.args[0].lower() in ("yes","on","true"); await db.set_setting(cid,"lockwarns",val); await update.effective_message.reply_text(f"lockwarns {'on' if val else 'off'}")
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_allowlist(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: items=await db.list_allow(cid); await update.effective_message.reply_text("Allowlist: "+", ".join(items) if items else "Empty"); return
     for it in context.args: await db.add_allow(cid,it)
     await update.effective_message.reply_text("Added: "+", ".join(context.args))
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_rmallowlist(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: await update.effective_message.reply_text("Usage: /rmallowlist <url>"); return
     for it in context.args: await db.rm_allow(cid,it)
     await update.effective_message.reply_text("Removed")
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_rmallowlistall(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     await db._exec("DELETE FROM allowlist WHERE chat_id=?",(cid,)); await update.effective_message.reply_text("✅ Allowlist cleared")
 @admin_required
 async def cmd_whitelist(update,context): await cmd_allowlist(update,context)
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_blocklist(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: items=await db.list_blocklist(cid); await update.effective_message.reply_text("Blocklist: "+", ".join(items) if items else "Empty"); return
     for w in context.args: await db.add_blocklist(cid,w)
     await update.effective_message.reply_text("Added to blocklist")
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_rmblocklist(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: await update.effective_message.reply_text("Usage: /rmblocklist <word>"); return
     for w in context.args: await db.rm_blocklist(cid,w)
     await update.effective_message.reply_text("Removed")
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_setflood(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: s=await db.get_settings(cid); await update.effective_message.reply_text(f"Flood limit: {s['flood_limit']}"); return
     try: n=int(context.args[0]); await db.set_setting(cid,"flood_limit",n); await update.effective_message.reply_text(f"Flood limit {n}")
     except: await update.effective_message.reply_text("Usage: /setflood 5")
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_setfloodmode(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
     if not context.args: s=await db.get_settings(cid); await update.effective_message.reply_text(f"Flood mode: {s['flood_mode']}"); return
     mode=" ".join(context.args); await db.set_setting(cid,"flood_mode",mode); await update.effective_message.reply_text(f"Flood mode {mode}")
 
-@admin_required
+@perm_required("can_delete_messages")
 async def cmd_tosprotection(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -1076,7 +1188,7 @@ async def cmd_setlog(update,context):
     await db.set_config("SUPPORT_CHAT_ID",val); await update.effective_message.reply_html(f"✅ Log channel set to <code>{esc(val)}</code>")
 
 # ── FILTERS FIXED (per-chat media) ──
-@admin_required
+@perm_required("can_change_info")
 async def cmd_addfilter(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -1110,7 +1222,7 @@ async def cmd_filters_list(update,context):
     txt="🗒 <b>Filters in this group:</b>\n" + "\n".join(f"• <code>{esc(t)}</code>" for t in items)
     await update.effective_message.reply_html((txt))
 
-@admin_required
+@perm_required("can_change_info")
 async def cmd_stopfilter(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -1119,7 +1231,7 @@ async def cmd_stopfilter(update,context):
     await update.effective_message.reply_text(f"Removed filter <code>{esc(trig)}</code>" if cnt else f"Filter <code>{esc(trig)}</code> not found")
     await log_to_support(context,f"DEL FILTER {trig}",cid,update.effective_user.id)
 
-@admin_required
+@perm_required("can_change_info")
 async def cmd_stopall(update,context):
     cid=await effective_chat_id(update,context)
     if not cid: return
@@ -1648,8 +1760,87 @@ async def cmd_import(update,context):
 
 # ── Utility ──
 async def cmd_start(update,context):
-    await update.effective_message.reply_html(branded_start("✨ <b>Miss Sona — The Secret Squad Guardian</b> ✨\n\nRose-parity + industrial modules.\n<b>Mod:</b> /ban /tban /mute /warn /promote /adminlist (all via reply/@ID)\n<b>Approve:</b> /approve /unapprove (via reply/@ID)\n<b>Locks:</b> /lock /unlock /locks /allowlist /setflood\n<b>Welcome:</b> /setwelcome {fullname} (reply to photo for media) /welcome on + CAPTCHA ✅\n<b>Filters:</b> /filter &lt;trigger&gt; &lt;reply&gt; or reply to media with /filter &lt;trigger&gt; — per-group!\n<b>Vault:</b> /addbword /listbwords (owner)\n<b>Broadcast:</b> /all /admins 5/3s\n<b>Shadow:</b> /shadowreply\n<b>Game:</b> /new /new4 /new5 /new6 /game /top — 📚 Stack Emojify Board\n<b>Support:</b> /support /setlog (logs all actions)\n<b>TOS AI:</b> /tos on/off — auto-delete Telegram TOS violating content (open-source AI) ✅\n<b>Connect:</b> /connect /connections (DM multi-group) — /connect in group then DM\n<b>Utility:</b> /export /import, /disable"))
-async def cmd_help(update,context): await cmd_start(update,context) # uses branded_start via cmd_start
+    txt = (
+        "✨ <b>Miss Sona — Your ultimate group Guardian</b> ✨\n\n"
+        "Used open source ai + industrial modules\n\n"
+        "Made with emojify love by the secret squad"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📚 Help", callback_data="help_main")]])
+    await update.effective_message.reply_html(branded_start(txt), reply_markup=kb)
+
+async def cmd_help(update,context):
+    await cmd_start(update,context)
+
+# ── Help button architecture (Member / Admin / Owner) ──
+HELP_MEMBER_TEXT = (
+    "👥 <b>Member Commands</b> — anyone can use\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "• <code>/rules</code> — view group rules\n"
+    "• <code>/adminlist</code> — list admins\n"
+    "• <code>/id</code> <code>/chatid</code> <code>/myid</code> — get IDs\n"
+    "• <code>/info</code> — user info (reply/@)\n"
+    "• <code>/top</code> — game leaderboard\n"
+    "• <code>/game</code> — word game status\n"
+    "• <code>/support</code> — support link\n"
+    "• <code>/help</code> — this menu\n"
+    "\n<i>Tip: Try <code>/new</code> to start a word game!</i>"
+)
+
+HELP_ADMIN_TEXT = (
+    "🛡️ <b>Admin Commands</b> — requires specific admin power\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "If you lack the power, bot replies:\n"
+    "<i>🚫 You don't have the power... Please contact the group owner.</i>\n\n"
+    "• <b>Restrict</b> (<code>can_restrict_members</code>) → <code>/ban</code> <code>/tban</code> <code>/unban</code> <code>/mute</code> <code>/tmute</code> <code>/unmute</code> <code>/kick</code> <code>/warn</code>\n"
+    "• <b>Delete</b> (<code>can_delete_messages</code>) → <code>/lock</code> <code>/unlock</code> <code>/locks</code> <code>/allowlist</code> <code>/blocklist</code> <code>/setflood</code> <code>/cleanwelcome</code>\n"
+    "• <b>Promote</b> (<code>can_promote_members</code>) → <code>/promote</code> <code>/demote</code>\n"
+    "• <b>Change Info</b> (<code>can_change_info</code>) → <code>/setwelcome</code> <code>/setrules</code> <code>/filter</code> <code>/note</code> <code>/setgoodbye</code>\n"
+    "• <b>Pin</b> (<code>can_pin_messages</code>) → <code>/pin</code> (if enabled)\n"
+    "• <b>Other:</b> <code>/all</code> <code>/admins</code> <code>/shadowreply</code> <code>/endgame</code>\n"
+    "\n<i>Owner gives powers via Group Info → Administrators → select admin → toggle rights.</i>"
+)
+
+HELP_OWNER_TEXT = (
+    "👑 <b>Group Owner Commands</b> — group creator only\n"
+    "━━━━━━━━━━━━━━━━━━━━\n"
+    "• <code>/fban</code> <code>&lt;@user|ID&gt;</code> [reason] — federation global ban\n"
+    "• <code>/unfban</code> — remove global ban\n"
+    "• <code>/listfbans</code> — list federation bans\n"
+    "• <code>/addbword</code> / <code>/rmbword</code> / <code>/listbwords</code> — owner vault\n"
+    "• <code>/setlog &lt;chat_id&gt;</code> — set log channel\n"
+    "• <code>/export</code> / <code>/import</code> — backup\n"
+    "• <code>/disable</code> / <code>/enable</code> — disable commands\n"
+    "\n<i>Bot Owner (OWNER_ID) also bypasses all checks.</i>"
+)
+
+async def cb_help(update,context):
+    q=update.callback_query
+    if not q: return
+    data=q.data
+    try: await q.answer()
+    except: pass
+    if data=="help_main":
+        kb=InlineKeyboardMarkup([
+            [InlineKeyboardButton("👥 Member", callback_data="help_member"),
+             InlineKeyboardButton("🛡️ Admin", callback_data="help_admin")],
+            [InlineKeyboardButton("👑 Group Owner", callback_data="help_owner")]
+        ])
+        try:
+            await q.edit_message_text("📚 <b>Miss Sona Help</b>\nChoose a section:", parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html("📚 <b>Miss Sona Help</b>\nChoose a section:", reply_markup=kb)
+    elif data=="help_member":
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="help_main")]])
+        try: await q.edit_message_text(HELP_MEMBER_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html(HELP_MEMBER_TEXT, reply_markup=kb)
+    elif data=="help_admin":
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="help_main")]])
+        try: await q.edit_message_text(HELP_ADMIN_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html(HELP_ADMIN_TEXT, reply_markup=kb)
+    elif data=="help_owner":
+        kb=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="help_main")]])
+        try: await q.edit_message_text(HELP_OWNER_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except: await q.message.reply_html(HELP_OWNER_TEXT, reply_markup=kb)
+
 async def cmd_id(update,context):
     msg=update.effective_message; user=update.effective_user
     cid=await effective_chat_id(update,context)
@@ -1661,12 +1852,27 @@ async def cmd_id(update,context):
     lines.append(f"\n<i>Resolve via reply, <code>@username</code> or numeric ID — {esc(BRAND_TAG)}</i>")
     await msg.reply_html("\n".join(lines))
 
+async def enforce_global_ban(update, context):
+    # Auto-ban federated banned users on join or message
+    if not update.effective_user or await is_owner(update.effective_user.id):
+        return
+    uid=update.effective_user.id
+    if await db.is_gbanned(uid):
+        chat=update.effective_chat
+        if chat and chat.type != "private":
+            try:
+                await context.bot.ban_chat_member(chat.id, uid)
+                await context.bot.send_message(chat.id, f"🌐 Auto-removed federated banned user {mention_html(uid, update.effective_user.full_name)}", parse_mode=ParseMode.HTML)
+                await log_to_support(context, f"GBAN ENFORCE {uid}", chat.id, None, uid)
+            except: pass
+
 async def error_handler(update,context): log.exception("Update %s error %s",update,context.error)
 
 def build_app():
     app=Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
     G_TRACK=-1; G_SEC=0; G_MAIN=1; G_FB=2
     app.add_handler(MessageHandler(filters.ALL, track_activity), group=G_TRACK)
+    app.add_handler(MessageHandler(filters.ALL, enforce_global_ban), group=G_TRACK)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tos_violation), group=G_SEC)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_security), group=G_SEC)
     app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE, handle_photo), group=G_SEC)
@@ -1722,6 +1928,10 @@ def build_app():
     app.add_handler(CommandHandler("setflood", cmd_setflood), group=G_MAIN)
     app.add_handler(CommandHandler("setfloodmode", cmd_setfloodmode), group=G_MAIN)
     app.add_handler(CommandHandler(["tos","tosprotection","tos_protection"], cmd_tosprotection), group=G_MAIN)
+    app.add_handler(CommandHandler(["fban","gban"], cmd_fban), group=G_MAIN)
+    app.add_handler(CommandHandler(["unfban","ungban"], cmd_unfban), group=G_MAIN)
+    app.add_handler(CommandHandler(["listfbans","fbans"], cmd_listfbans), group=G_MAIN)
+    app.add_handler(CallbackQueryHandler(cb_help, pattern=r"^help_"), group=G_MAIN)
     app.add_handler(CommandHandler("cleanwelcome", cmd_cleanwelcome), group=G_MAIN)
     app.add_handler(CommandHandler("cleanservice", cmd_cleanservice), group=G_MAIN)
     app.add_handler(CommandHandler("setwelcome", cmd_setwelcome), group=G_MAIN)
